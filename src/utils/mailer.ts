@@ -1,4 +1,5 @@
 import nodemailer from "nodemailer";
+import dns from "dns";
 
 /**
  * Único punto donde se arma el transporte SMTP — hoy solo lo usa
@@ -20,39 +21,63 @@ import nodemailer from "nodemailer";
  * - SMTP_PASS=<contraseña de aplicación de 16 caracteres, NUNCA la
  *   contraseña normal de la cuenta — Gmail exige verificación en dos
  *   pasos activada para poder generar una>
- *
- * `createTransport` no abre ninguna conexión de inmediato (nodemailer es
- * perezoso — solo conecta cuando se llama `sendMail`), así que es seguro
- * crear el transporte al cargar el módulo aunque las variables SMTP_*
- * todavía no estén configuradas en un entorno de desarrollo que no
- * necesite probar el envío real de correos.
  */
-// `smtp.gmail.com` resuelve a IPv4 Y a IPv6 (AAAA) — muchos hosts de
-// contenedores (ej. Render) no tienen salida IPv6 real, así que si Node
-// elige la dirección IPv6 primero la conexión falla con `ENETUNREACH`
-// (visto en producción). `family: 4` fuerza a que esta conexión SMTP
-// puntual use siempre IPv4, sin tocar la resolución DNS global de todo
-// el proceso (que sí podría afectar Mongo/Redis/Cloudinary si se
-// cambiara a nivel de `dns.setDefaultResultOrder`). Nodemailer sí soporta
-// esta opción en tiempo de ejecución (la reenvía al `net`/`tls.connect`
-// de Node por debajo) pero sus propios tipos no la declaran — armar el
-// objeto en una `const` aparte (sin anotar el tipo) evita el "excess
-// property check" de TypeScript que sí dispara si se pasa como literal
-// directo a `createTransport(...)`.
-const transportOptions = {
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: process.env.SMTP_SECURE !== "false",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  family: 4,
-};
-
-const transporter = nodemailer.createTransport(transportOptions);
-
+const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 465;
+const SMTP_SECURE = process.env.SMTP_SECURE !== "false";
 const FROM_ADDRESS = process.env.SMTP_FROM || process.env.SMTP_USER;
+
+/**
+ * Bug real de producción — Render (y hosts de contenedores similares) le
+ * conecta a `smtp.gmail.com` por IPv6 y falla con `ENETUNREACH` porque esa
+ * salida no existe ahí. Nodemailer resuelve DNS por su cuenta
+ * (`node_modules/nodemailer/lib/shared/index.js`, `resolveHostname`) con
+ * una heurística propia (`isFamilySupported`, basada en escanear
+ * `os.networkInterfaces()` del proceso) para decidir si vale la pena
+ * intentar IPv4 — en el contenedor de Render esa heurística concluye que
+ * no, así que solo termina resolviendo/usando la dirección IPv6 de Gmail.
+ * **No existe ninguna opción documentada de nodemailer para forzar IPv4**
+ * (`family`, `ipVersion`, etc. — confirmado leyendo el código fuente de
+ * `smtp-connection/index.js`/`shared/index.js`: nunca leen `options.family`,
+ * pasarlo no hace nada aunque TypeScript lo acepte con un cast). La única
+ * forma confiable de evitar su resolución interna: `resolveHostname` se
+ * salta TODA esa lógica si `host` ya es una IP literal
+ * (`net.isIP(options.host)` true) — así que resolvemos la IPv4 nosotros
+ * mismos con `dns.promises.resolve4()` y se la pasamos directo. Hace
+ * falta `servername` (opción de nivel superior, no anidada en `tls`,
+ * también leída directo de `SMTPConnection`) con el hostname real — si no,
+ * la validación del certificado TLS falla porque el certificado de Gmail
+ * no cubre la IP cruda.
+ *
+ * Se resuelve de nuevo en cada envío (no se cachea la IP) — el volumen de
+ * este correo es bajísimo (solo "olvidé mi contraseña"), así que el costo
+ * de un lookup DNS extra por envío no importa, y evita quedarse pegado a
+ * una IP vieja si la infraestructura de Gmail cambia.
+ */
+async function createSmtpTransport() {
+  const [ip] = await dns.promises.resolve4(SMTP_HOST);
+  if (!ip) {
+    throw new Error(`No se pudo resolver una dirección IPv4 para ${SMTP_HOST}`);
+  }
+
+  // `servername` (como `family` antes) es una opción real de
+  // `SMTPConnection` que su propio paquete no declara en los tipos —
+  // armarla en una `const` sin anotar el tipo evita el "excess property
+  // check" que sí dispara al pasarla como literal directo a
+  // `createTransport(...)`.
+  const transportOptions = {
+    host: ip,
+    servername: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  };
+
+  return nodemailer.createTransport(transportOptions);
+}
 
 /**
  * Envía el correo de "recuperar contraseña" — HTML simple, sin plantilla
@@ -62,6 +87,7 @@ const FROM_ADDRESS = process.env.SMTP_FROM || process.env.SMTP_USER;
  * conoce el token, solo lo manda.
  */
 export async function sendPasswordResetEmail(to: string, name: string, resetUrl: string) {
+  const transporter = await createSmtpTransport();
   await transporter.sendMail({
     from: `"Mecatos el Santi" <${FROM_ADDRESS}>`,
     to,

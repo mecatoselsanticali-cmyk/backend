@@ -27,7 +27,19 @@ import nodemailer from "nodemailer";
  * todavía no estén configuradas en un entorno de desarrollo que no
  * necesite probar el envío real de correos.
  */
-const transporter = nodemailer.createTransport({
+// `smtp.gmail.com` resuelve a IPv4 Y a IPv6 (AAAA) — muchos hosts de
+// contenedores (ej. Render) no tienen salida IPv6 real, así que si Node
+// elige la dirección IPv6 primero la conexión falla con `ENETUNREACH`
+// (visto en producción). `family: 4` fuerza a que esta conexión SMTP
+// puntual use siempre IPv4, sin tocar la resolución DNS global de todo
+// el proceso (que sí podría afectar Mongo/Redis/Cloudinary si se
+// cambiara a nivel de `dns.setDefaultResultOrder`). Nodemailer sí soporta
+// esta opción en tiempo de ejecución (la reenvía al `net`/`tls.connect`
+// de Node por debajo) pero sus propios tipos no la declaran — armar el
+// objeto en una `const` aparte (sin anotar el tipo) evita el "excess
+// property check" de TypeScript que sí dispara si se pasa como literal
+// directo a `createTransport(...)`.
+const transportOptions = {
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT) || 465,
   secure: process.env.SMTP_SECURE !== "false",
@@ -35,7 +47,10 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
-});
+  family: 4,
+};
+
+const transporter = nodemailer.createTransport(transportOptions);
 
 const FROM_ADDRESS = process.env.SMTP_FROM || process.env.SMTP_USER;
 

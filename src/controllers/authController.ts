@@ -6,7 +6,12 @@ import ms from "ms";
 import { User } from "../models/User";
 import { Branch } from "../models/Branch";
 import { setAuthCookie, clearAuthCookie } from "../utils/cookies";
-import { sendPasswordResetEmail } from "../utils/mailer";
+// PRUEBA: cambiado temporalmente de "../utils/mailer" (SMTP/nodemailer,
+// bloqueado por el firewall de salida de Render) a "../utils/mailerResend"
+// (API HTTP de Resend) para probar si eso resuelve el envío en producción.
+// `mailer.ts` sigue intacto — para revertir, solo cambia este import de
+// vuelta a "../utils/mailer".
+import { sendPasswordResetEmail } from "../utils/mailerResend";
 
 const ADMIN_TOKEN_TTL = process.env.JWT_EXPIRES_IN || "8h";
 const POS_TOKEN_TTL = process.env.POS_SESSION_EXPIRES_IN || "12h";

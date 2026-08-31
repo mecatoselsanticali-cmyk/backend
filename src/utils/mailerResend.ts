@@ -31,6 +31,17 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FROM_ADDRESS = process.env.RESEND_FROM || "Mecatos el Santi <onboarding@resend.dev>";
 
+// Mismo logo que usa `Login.tsx`/`AuthShell.tsx` en el frontend
+// (`admin-frontend/public/img/logo-santi-trimmed.png`) — no se copia el
+// archivo al backend ni se adjunta al correo, se referencia por URL
+// (el frontend ya lo sirve como asset estático público). Requiere que
+// `FRONTEND_URL` sea la URL real del frontend desplegado — con el
+// default de `localhost:5174` el logo simplemente no carga en un
+// cliente de correo real (nadie fuera de esta máquina puede pedirle una
+// imagen a tu propio localhost), pero el resto del correo sigue
+// funcionando igual (el `alt` queda como texto de respaldo).
+const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.png`;
+
 export async function sendPasswordResetEmail(to: string, name: string, resetUrl: string) {
   const { error } = await resend.emails.send({
     from: FROM_ADDRESS,
@@ -38,7 +49,8 @@ export async function sendPasswordResetEmail(to: string, name: string, resetUrl:
     subject: "Recupera tu contraseña — Mecatos el Santi",
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
-        <h2 style="color: #ea580c;">Mecatos el Santi</h2>
+        <img src="${LOGO_URL}" alt="Mecatos el Santi" style="display: block; width: 160px; max-width: 100%; margin: 0 auto 16px;" />
+        <h2 style="color: #ea580c; text-align: center;">Mecatos el Santi</h2>
         <p>Hola ${name},</p>
         <p>Recibimos una solicitud para restablecer tu contraseña del panel administrativo.</p>
         <p>

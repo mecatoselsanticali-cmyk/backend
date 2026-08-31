@@ -598,7 +598,7 @@ deliberadamente más simple que ambos**:
   todo ese punto. Ahora usa `formatDateTime` de `utils/timezone.ts`, igual
   que `Compras.tsx`/`Ventas.tsx`.
 
-### 40. "Olvidé mi contraseña" (ADMIN/MANAGER) — token de un solo uso por correo SMTP, no JWT
+### 40. "Olvidé mi contraseña" (ADMIN/MANAGER) — token de un solo uso, correo por Resend (API HTTP) tras confirmar que Render bloquea SMTP saliente
 
 Solo ADMIN/MANAGER pueden recuperar contraseña — un cajero no tiene
 `email`/`password` en absoluto (usa PIN, ver `posLogin`), así que ni
@@ -673,14 +673,81 @@ antemano. Valores esperados: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=465`,
 **`FRONTEND_URL` es una variable de entorno nueva** (no existía ninguna
 "URL del frontend" en el backend antes de esto — lo más cercano era
 `CORS_ORIGIN`, que es una lista de orígenes permitidos para CORS, no una
-URL única para armar links) — se usa solo para construir
-`${FRONTEND_URL}/reset-password?token=...` en el cuerpo del correo,
-default `http://localhost:5174` si no está definida. Agregada a
-`backend/.env` y al bloque `environment` del servicio `backend` en
-`docker-compose.yml`, junto a las `SMTP_*` — **no existe un
-`backend/.env.example`** en este repo (solo `admin-frontend/.env.example`)
-para mantener sincronizado; si en algún momento se crea uno, agregar
-estas variables ahí también.
+URL única para armar links) — se usa para construir
+`${FRONTEND_URL}/reset-password?token=...` en el cuerpo del correo (y
+también el logo del correo, ver más abajo), default `http://localhost:5174`
+si no está definida. Agregada a `backend/.env` y al bloque `environment`
+del servicio `backend` en `docker-compose.yml`, junto a las `SMTP_*` —
+**no existe un `backend/.env.example`** en este repo (solo
+`admin-frontend/.env.example`) para mantener sincronizado; si en algún
+momento se crea uno, agregar estas variables ahí también.
+
+**Bug real de producción, encontrado ya con el negocio conectado a
+Gmail real — el SMTP de Gmail queda bloqueado en Render.** Ocurrió en dos
+etapas:
+1. `ENETUNREACH` conectando a `smtp.gmail.com` — Render no rutea IPv6
+   como salida real, pero nodemailer resuelve DNS con una heurística
+   propia (`isFamilySupported`, basada en escanear
+   `os.networkInterfaces()` del proceso, ver `mailer.ts`) que en el
+   contenedor de Render concluye que IPv4 no vale la pena intentar, así
+   que solo terminaba resolviendo/usando la dirección IPv6 de Gmail. Se
+   corrigió resolviendo la IPv4 a mano con `dns.promises.resolve4()` y
+   pasándosela a nodemailer como `host` ya literal (`net.isIP(...)` true
+   hace que nodemailer se salte toda su lógica de resolución propia) —
+   detalle completo en los comentarios de `mailer.ts`.
+2. Con eso corregido, la conexión IPv4 al puerto 465 pasó a colgarse
+   hasta `ETIMEDOUT` (nunca un rechazo inmediato) — el patrón típico de
+   un firewall de salida que descarta el tráfico en silencio, no de un
+   problema de ruteo. **Render bloquea los puertos SMTP salientes
+   estándar (465/587/25) a nivel de plataforma, para evitar que su
+   infraestructura se use para spam** — esto no es arreglable desde el
+   código de la app, ningún ajuste de nodemailer/sockets lo resuelve,
+   confirmado tras agotar las opciones a nivel de aplicación.
+
+**La solución real: dejar de usar SMTP directo y mandar el correo por
+una API HTTP** (puerto 443, que ningún host bloquea) — `backend/src/
+utils/mailerResend.ts` (nuevo archivo, SDK oficial `resend` — nueva
+dependencia) usando Resend. **Este es ahora el `sendPasswordResetEmail`
+activo** — `authController.ts` importa de `./mailerResend`, no de
+`./mailer`. `mailer.ts` (SMTP/nodemailer, con la corrección de IPv4 ya
+aplicada) **se dejó intacto a propósito, sin borrar** — sigue siendo
+código válido y funcional (útil si el negocio cambia de proveedor de
+correo a uno que sí permita SMTP saliente, o si se despliega en un host
+sin este bloqueo); para volver a usarlo, el único cambio es el import en
+`authController.ts`. Mismo patrón de "probar y dejar la alternativa
+intacta" que ya se sigue en otras partes del proyecto (ver el patrón de
+`src/cajero/` duplicado, aunque acá es dos implementaciones alternativas
+de la misma función, no una copia estructural).
+
+Variables nuevas: `RESEND_API_KEY` (dashboard de Resend > API Keys) y
+`RESEND_FROM` (opcional — sin dominio propio verificado en Resend, debe
+quedar vacío, lo que hace que `mailerResend.ts` use su remitente de
+prueba `onboarding@resend.dev`). **Gotcha real de la cuenta de Resend en
+modo de prueba (sin verificar dominio): solo permite mandar correos a la
+dirección de correo con la que se creó la cuenta de Resend, a cualquier
+otro destinatario le falla** — suficiente para confirmar que el envío por
+HTTP funciona (lo cual se verificó así, en producción, con el token
+crafteado a mano contra la base real), pero no sirve para usuarios reales
+hasta verificar un dominio propio en el dashboard de Resend (agrega unos
+registros DNS SPF/DKIM) — con eso se levantan ambas restricciones
+(remitente genérico y destinatario único).
+
+**Logo del negocio en el correo** — `mailerResend.ts`/`mailer.ts`
+arman `LOGO_URL` como `${FRONTEND_URL}/img/logo-santi-trimmed.png`, el
+mismo PNG que ya sirve el frontend como asset estático público (el mismo
+que usa `Login.tsx`/`AuthShell.tsx`, ver `admin-frontend/CLAUDE.md`) —
+**referenciado por URL, no adjunto ni copiado al backend**: el correo es
+HTML con un `<img src="...">` normal, así que depende de que
+`FRONTEND_URL` sea la URL real y pública del frontend desplegado. Con el
+default de desarrollo (`http://localhost:5174`), el logo simplemente no
+carga en un cliente de correo real (nadie fuera de la máquina de
+desarrollo puede pedirle una imagen a su propio `localhost`) — el resto
+del correo sigue funcionando igual, y el `alt="Mecatos el Santi"` queda
+como texto de respaldo si el cliente de correo bloquea imágenes remotas
+por defecto (comportamiento normal de Gmail/Outlook hasta que el
+destinatario elige "mostrar imágenes"). Si se agrega otro correo
+transaccional a futuro que también necesite el logo, reutiliza
+`LOGO_URL` en vez de armar la URL de nuevo en un tercer archivo.
 
 ### 41. Fotos de producto migraron de disco local a Cloudinary — `utils/imageProcessing.ts` ya no existe
 

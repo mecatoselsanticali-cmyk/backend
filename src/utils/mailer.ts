@@ -27,6 +27,14 @@ const SMTP_PORT = Number(process.env.SMTP_PORT) || 465;
 const SMTP_SECURE = process.env.SMTP_SECURE !== "false";
 const FROM_ADDRESS = process.env.SMTP_FROM || process.env.SMTP_USER;
 
+// Mismo logo que usa `Login.tsx`/`AuthShell.tsx` en el frontend
+// (`admin-frontend/public/img/logo-santi-trimmed.png`), referenciado por
+// URL — no adjunto, no copiado al backend. Ver el mismo comentario en
+// `mailerResend.ts` (`LOGO_URL`) para el detalle de por qué depende de
+// que `FRONTEND_URL` sea la URL real desplegada, no el default de
+// `localhost`.
+const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.png`;
+
 /**
  * Bug real de producción — Render (y hosts de contenedores similares) le
  * conecta a `smtp.gmail.com` por IPv6 y falla con `ENETUNREACH` porque esa
@@ -94,7 +102,8 @@ export async function sendPasswordResetEmail(to: string, name: string, resetUrl:
     subject: "Recupera tu contraseña — Mecatos el Santi",
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
-        <h2 style="color: #ea580c;">Mecatos el Santi</h2>
+        <img src="${LOGO_URL}" alt="Mecatos el Santi" style="display: block; width: 160px; max-width: 100%; margin: 0 auto 16px;" />
+        <h2 style="color: #ea580c; text-align: center;">Mecatos el Santi</h2>
         <p>Hola ${name},</p>
         <p>Recibimos una solicitud para restablecer tu contraseña del panel administrativo.</p>
         <p>

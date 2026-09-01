@@ -4,9 +4,10 @@ import { ProductStock } from "../models/ProductStock";
 import { Sale, resolvePaymentStatus } from "../models/Sale";
 import { Branch } from "../models/Branch";
 import { Expense } from "../models/Expense";
+import { StockLoss } from "../models/StockLoss";
 import { dianService } from "../services/dianService";
 import { enqueueSaleForDianEmission } from "../queues/dianQueue";
-import { logSaleToSheets, logExpenseToSheets, syncInventoryToSheets } from "../utils/sheetsSync";
+import { logSaleToSheets, logExpenseToSheets, logStockLossToSheets, syncInventoryToSheets } from "../utils/sheetsSync";
 import { getCashierShiftStart } from "../utils/shiftRange";
 import { getStartOfTodayColombia } from "../utils/dateRange";
 import { Types } from "mongoose";
@@ -16,9 +17,23 @@ import { Types } from "mongoose";
  * sede del cajero. Antes devolvía todo `active: true` sin mirar
  * ProductStock — un cajero podía intentar vender algo con 0 unidades en su
  * sede. El grid ya no debe ofrecer eso como opción.
+ *
+ * Pagina desde el backend (`page`/`pageSize`, mismo shape `{ data, total,
+ * page, pageSize, totalPages }` que el resto de endpoints `list*`, ver
+ * punto 15 de CLAUDE.md) y acepta `search` (nombre o SKU) y `category` —
+ * antes devolvía el catálogo completo de la sede de una sola vez y
+ * `CategoryMenu.tsx` filtraba/paginaba todo en el cliente, lo cual dejaba
+ * de tener sentido en cuanto el catálogo de una sede crece lo suficiente
+ * para no caber cómodo en una sola pantalla táctil.
+ *
+ * `categories` en la respuesta es la lista de categorías distintas del
+ * catálogo COMPLETO en stock de la sede (sin aplicar `search`/`category`,
+ * calculada sobre `baseFilter`) — así las pestañas de categoría del
+ * frontend no aparecen/desaparecen mientras el cajero busca o pagina.
  */
 export async function getCatalog(req: Request, res: Response) {
   const posSession = req.posSession!;
+  const { search, category } = req.query;
 
   const stocks = await ProductStock.find({
     branchId: posSession.branchId,
@@ -26,11 +41,44 @@ export async function getCatalog(req: Request, res: Response) {
   }).select("productId");
   const inStockIds = stocks.map((s) => s.productId);
 
-  const products = await Product.find({ active: true, _id: { $in: inStockIds } }).sort({
-    category: 1,
-    name: 1,
+  const baseFilter: any = { active: true, _id: { $in: inStockIds } };
+  const categories = await Product.distinct("category", baseFilter);
+
+  const filter: any = { ...baseFilter };
+  if (category) filter.category = String(category);
+  if (search) {
+    const term = String(search).trim();
+    if (term) {
+      // Mismo patrón de regex escapado + case-insensitive que
+      // listBranches/listUsers (ver punto 15/18 de backend/CLAUDE.md) — el
+      // catálogo de una sede no justifica un índice $text aparte.
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$or = [
+        { name: { $regex: escaped, $options: "i" } },
+        { sku: { $regex: escaped, $options: "i" } },
+      ];
+    }
+  }
+
+  const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize ?? "24"), 10) || 24));
+
+  const [products, total] = await Promise.all([
+    Product.find(filter)
+      .sort({ category: 1, name: 1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize),
+    Product.countDocuments(filter),
+  ]);
+
+  return res.json({
+    data: products,
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    categories: categories.sort(),
   });
-  return res.json(products);
 }
 
 /**
@@ -383,4 +431,65 @@ export async function registerPettyCashExpense(req: Request, res: Response) {
   });
 
   return res.status(201).json(expense);
+}
+
+const STOCK_LOSS_REASONS = ["DAMAGED", "STAFF_CONSUMPTION", "OTHER"];
+
+/**
+ * POST /api/pos/stock-losses -> registrar una merma (producto dañado/
+ * vencido, consumo interno de un empleado, etc.) — reduce ProductStock sin
+ * que exista una venta ni ningún movimiento de dinero detrás. Mismo
+ * `$gte` de defensa contra concurrencia que `createSale`/
+ * `deletePurchaseAdmin`, pero acá se aplica ANTES de crear el registro (a
+ * diferencia de `createSale`, que crea la venta primero): una merma sin
+ * stock real que la respalde no tiene ningún valor que preservar para
+ * reconciliar a mano, así que no tiene sentido dejar un `StockLoss`
+ * huérfano si el descuento falla.
+ */
+export async function registerStockLoss(req: Request, res: Response) {
+  const posSession = req.posSession!;
+  const { productId, quantity, reason, note } = req.body;
+
+  if (!productId || !quantity || !reason) {
+    return res.status(400).json({ error: "Producto, cantidad y motivo son requeridos" });
+  }
+  const parsedQuantity = Number(quantity);
+  if (!(parsedQuantity > 0)) {
+    return res.status(400).json({ error: "La cantidad debe ser mayor a 0" });
+  }
+  if (!STOCK_LOSS_REASONS.includes(reason)) {
+    return res.status(400).json({ error: "Motivo inválido" });
+  }
+
+  const product = await Product.findById(productId);
+  if (!product) return res.status(404).json({ error: "Producto no encontrado" });
+
+  const updated = await ProductStock.findOneAndUpdate(
+    { productId: product._id, branchId: posSession.branchId, quantity: { $gte: parsedQuantity } },
+    { $inc: { quantity: -parsedQuantity } }
+  );
+  if (!updated) {
+    return res.status(422).json({
+      error: "STOCK_INSUFICIENTE",
+      message: `No hay stock suficiente de ${product.name} para registrar esta merma`,
+    });
+  }
+
+  const stockLoss = await StockLoss.create({
+    branchId: posSession.branchId,
+    productId: product._id,
+    registeredBy: posSession.cashierId,
+    quantity: parsedQuantity,
+    reason,
+    note: note || undefined,
+  });
+
+  logStockLossToSheets(stockLoss).catch((err) => {
+    console.error(`[registerStockLoss] No se pudo sincronizar la merma ${stockLoss._id} a Sheets:`, err);
+  });
+  syncInventoryToSheets(product._id as Types.ObjectId).catch((err) => {
+    console.error(`[registerStockLoss] No se pudo sincronizar inventario de ${product._id} a Sheets:`, err);
+  });
+
+  return res.status(201).json(stockLoss);
 }

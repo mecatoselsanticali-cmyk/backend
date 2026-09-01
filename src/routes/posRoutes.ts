@@ -6,6 +6,7 @@ import {
   syncOfflineSales,
   getDailyTotal,
   registerPettyCashExpense,
+  registerStockLoss,
   listCashierSales,
 } from "../controllers/posController";
 import {
@@ -49,6 +50,10 @@ router.get("/stock-snapshot", requirePosSession, asyncHandler(getStockSnapshot))
 
 // Gastos menores
 router.post("/expenses", requirePosSession, asyncHandler(registerPettyCashExpense));
+
+// Mermas de stock (producto dañado/vencido, consumo interno de un
+// empleado, etc.) — reduce ProductStock sin una venta detrás
+router.post("/stock-losses", requirePosSession, asyncHandler(registerStockLoss));
 
 // Compras del día (pestaña "Compras" del cajero) — producto + cantidad,
 // ligadas a inventario (ver createPurchase en purchaseController.ts)

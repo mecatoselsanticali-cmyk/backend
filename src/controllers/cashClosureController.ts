@@ -72,6 +72,12 @@ async function computeShiftFinancials(shift: ICashClosure) {
  * con stock > 0 — no tiene sentido pedirle al cajero que verifique algo
  * que ya está en 0 (mismo criterio que `getCatalog` en posController.ts
  * para el grid de venta).
+ *
+ * Reutilizado también como selector de producto en `StockLossModal.tsx`
+ * (ver punto 45 de admin-frontend/src/cajero/CLAUDE.md) — por eso incluye
+ * `productId`, que la verificación de turno en sí no necesita (ahí solo se
+ * muestra la tabla, no se selecciona una fila). Agregarlo acá no afecta a
+ * ese consumidor, solo se ignora.
  */
 async function buildStockSnapshot(branchId: string) {
   const stocks = await ProductStock.find({ branchId, quantity: { $gt: 0 } }).lean();
@@ -84,7 +90,14 @@ async function buildStockSnapshot(branchId: string) {
   return products
     .map((p) => {
       const quantity = quantityByProduct.get(String(p._id)) || 0;
-      return { sku: p.sku, name: p.name, price: p.price, quantity, totalValue: p.price * quantity };
+      return {
+        productId: String(p._id),
+        sku: p.sku,
+        name: p.name,
+        price: p.price,
+        quantity,
+        totalValue: p.price * quantity,
+      };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 }

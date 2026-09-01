@@ -5,6 +5,7 @@ import { ProductStock } from "../models/ProductStock";
 import { ISale } from "../models/Sale";
 import { IPurchase } from "../models/Purchase";
 import { IExpense } from "../models/Expense";
+import { IStockLoss } from "../models/StockLoss";
 import { enqueueSheetsSync } from "../queues/sheetsQueue";
 
 /**
@@ -115,6 +116,37 @@ export async function logExpenseToSheets(expense: IExpense) {
     category: expense.category,
     descriptionOrId: expense.concept,
     amount: expense.amount,
+    paymentMethod: "N/A",
+    cashierUser: registeredBy,
+  });
+}
+
+/**
+ * Registra una merma de stock (producto dañado/vencido, consumo interno de
+ * un empleado, etc. — sin venta ni movimiento de dinero real detrás) como
+ * fila en OPERATIONAL_LOGS, `movementType: "STOCK_LOSS"`. `amount` es el
+ * valor de venta estimado de lo perdido (cantidad x precio del producto),
+ * no dinero que de verdad se movió — así el reporte refleja el impacto
+ * económico de la merma, no solo la cantidad. `Code.gs` no valida
+ * `movementType` contra una lista fija (ver `handleOperationalLog` en
+ * docs/GOOGLE_SHEETS_INTEGRATION.md) — un valor nuevo aparece tal cual en
+ * la columna `Movement_Type`, sin requerir ningún cambio del lado del
+ * Apps Script.
+ */
+export async function logStockLossToSheets(stockLoss: IStockLoss) {
+  const [branch, registeredBy, product] = await Promise.all([
+    branchName(stockLoss.branchId),
+    userName(stockLoss.registeredBy),
+    Product.findById(stockLoss.productId).select("name price").lean(),
+  ]);
+  await enqueueSheetsSync("LOG_TRANSACTION", {
+    branch,
+    movementType: "STOCK_LOSS",
+    category: stockLoss.reason,
+    descriptionOrId: product?.name
+      ? `${stockLoss.quantity} x ${product.name}${stockLoss.note ? ` — ${stockLoss.note}` : ""}`
+      : `Merma (${stockLoss.quantity} unidades)`,
+    amount: (product?.price || 0) * stockLoss.quantity,
     paymentMethod: "N/A",
     cashierUser: registeredBy,
   });

@@ -18,6 +18,7 @@ import {
   openShift,
   closeShift,
   getStockSnapshot,
+  adjustStockCount,
   getShiftSummary,
   getCurrentShift,
 } from "../controllers/cashClosureController";
@@ -47,6 +48,7 @@ router.post("/shifts/open", requirePosSession, asyncHandler(openShift));
 router.post("/shifts/:id/close", requirePosSession, asyncHandler(closeShift));
 router.get("/shifts/:id/summary", requirePosSession, asyncHandler(getShiftSummary));
 router.get("/stock-snapshot", requirePosSession, asyncHandler(getStockSnapshot));
+router.post("/stock-snapshot/adjust", requirePosSession, asyncHandler(adjustStockCount));
 
 // Gastos menores
 router.post("/expenses", requirePosSession, asyncHandler(registerPettyCashExpense));

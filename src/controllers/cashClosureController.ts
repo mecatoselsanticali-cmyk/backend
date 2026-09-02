@@ -2,10 +2,11 @@ import { Request, Response } from "express";
 import { CashClosure, ICashClosure, IStockVerification } from "../models/CashClosure";
 import { Sale } from "../models/Sale";
 import { Expense } from "../models/Expense";
+import { Purchase } from "../models/Purchase";
 import { User } from "../models/User";
 import { Product } from "../models/Product";
 import { ProductStock } from "../models/ProductStock";
-import { logCashClosureToSheets } from "../utils/sheetsSync";
+import { logCashClosureToSheets, syncInventoryToSheets } from "../utils/sheetsSync";
 import { resolveBranchFilter } from "./adminController";
 import { startOfLocalDay, endOfLocalDay } from "../utils/dateRange";
 
@@ -46,10 +47,31 @@ async function computeShiftFinancials(shift: ICashClosure) {
     })
   ).reduce((acc, e) => acc + e.amount, 0);
 
-  const systemCalculatedCash = shift.initialCash + cashSales - pettyCashExpenses;
+  // Compras que el cajero registró durante ESTE turno (`Purchase`, ver
+  // punto 16 de admin-frontend/CLAUDE.md) — antes no se restaban del
+  // efectivo esperado, un hueco real: comprar $200.000 de insumos con el
+  // efectivo de la caja SÍ saca ese dinero de la gaveta, así que dejarlo
+  // fuera del cálculo hacía que `systemCalculatedCash` sobreestimara lo
+  // que debería haber físicamente. `createPurchase` (posController.ts)
+  // siempre las crea con `paymentMethod: "CASH"` — el filtro de acá es
+  // explícito de todos modos, no por desconfianza sino para que el
+  // cálculo siga siendo correcto si algún día se agrega otro medio de
+  // pago a las compras del cajero.
+  const cashPurchases = (
+    await Purchase.find({
+      branchId: shift.branchId,
+      registeredBy: shift.cashierId,
+      paymentMethod: "CASH",
+      createdAt: { $gte: shift.openedAt },
+    })
+  ).reduce((acc, p) => acc + p.amount, 0);
+
+  const systemCalculatedCash = shift.initialCash + cashSales - pettyCashExpenses - cashPurchases;
   // El saldo de Nequi no se gasta en efectivo (no hay "caja menor" en
   // Nequi), así que a diferencia del efectivo solo suma la base inicial
-  // más lo vendido por ese medio — nada se resta.
+  // más lo vendido por ese medio — nada se resta. Las compras del cajero
+  // siempre son en efectivo (ver arriba), así que tampoco hay nada que
+  // restarle a Nequi por ese lado.
   const systemCalculatedNequi = shift.initialNequi + nequiTotal;
 
   return {
@@ -58,6 +80,7 @@ async function computeShiftFinancials(shift: ICashClosure) {
     nequiTotal,
     appsTotal,
     pettyCashExpenses,
+    cashPurchases,
     systemCalculatedCash,
     systemCalculatedNequi,
   };
@@ -107,6 +130,45 @@ export async function getStockSnapshot(req: Request, res: Response) {
   const posSession = req.posSession!;
   const snapshot = await buildStockSnapshot(posSession.branchId);
   return res.json(snapshot);
+}
+
+/**
+ * POST /api/pos/stock-snapshot/adjust -> corrige `ProductStock.quantity` al
+ * valor que el cajero contó físicamente durante la verificación de stock
+ * de `StockVerificationV2.tsx` (ver punto 47 de admin-frontend/src/cajero/
+ * CLAUDE.md) — fila por fila, en vez del toggle único + anotación de texto
+ * libre del diseño original (`StockVerification` en `ShiftModal.tsx`, que
+ * sigue existiendo sin cambios).
+ *
+ * A propósito FIJA la cantidad (`$set`), no aplica un delta (`$inc`) como
+ * `createSale`/`createPurchase`/`registerStockLoss` — el cajero está
+ * reportando "esto es lo que hay", no "esto es lo que cambió", así que no
+ * hay ninguna condición de carrera que defender con un `$gte`: cualquier
+ * valor no negativo es válido, sin importar cuál fuera el anterior.
+ */
+export async function adjustStockCount(req: Request, res: Response) {
+  const posSession = req.posSession!;
+  const { productId, quantity } = req.body;
+
+  if (!productId || quantity === undefined) {
+    return res.status(400).json({ error: "Producto y cantidad son requeridos" });
+  }
+  const parsedQuantity = Number(quantity);
+  if (!Number.isFinite(parsedQuantity) || parsedQuantity < 0) {
+    return res.status(400).json({ error: "La cantidad debe ser un número mayor o igual a 0" });
+  }
+
+  const updated = await ProductStock.findOneAndUpdate(
+    { productId, branchId: posSession.branchId },
+    { $set: { quantity: parsedQuantity } },
+    { upsert: true, new: true }
+  );
+
+  syncInventoryToSheets(productId).catch((err) => {
+    console.error(`[adjustStockCount] No se pudo sincronizar inventario de ${productId} a Sheets:`, err);
+  });
+
+  return res.json({ productId, quantity: updated.quantity });
 }
 
 function parseStockVerification(req: Request): IStockVerification {

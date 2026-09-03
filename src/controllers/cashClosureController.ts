@@ -14,15 +14,29 @@ import { startOfLocalDay, endOfLocalDay } from "../utils/dateRange";
  * Calcula el desglose de ventas/gastos de un turno (por método de pago,
  * gastos de caja menor, y el efectivo/Nequi que el sistema espera) —
  * compartido entre el resumen que ve el cajero ANTES de declarar
- * (`getShiftSummary`, ver nota sobre arqueo no-ciego más abajo) y el
- * cálculo real que hace `closeShift` al cerrar, para no duplicar la
- * lógica en dos lugares que podrían desincronizarse.
+ * (`getShiftSummary`, ver nota sobre arqueo no-ciego más abajo), el
+ * cálculo real que hace `closeShift` al cerrar, y el detalle que ve el
+ * admin/gerente de un turno ya cerrado (`getCashClosureDetail`, ver punto
+ * 51 de admin-frontend/CLAUDE.md), para no duplicar la lógica en varios
+ * lugares que podrían desincronizarse.
+ *
+ * `endDate` opcional acota la ventana de ventas/gastos/compras a
+ * `[shift.openedAt, endDate]` en vez de `[shift.openedAt, ahora]` — sin
+ * esto, pedir el detalle de un turno cerrado HACE RATO sumaría también
+ * cualquier venta que el mismo cajero haya hecho después, ya en su
+ * turno siguiente. `getShiftSummary`/`closeShift` (turno todavía
+ * abierto) lo llaman sin `endDate` a propósito — no hay un "cierre" con
+ * el cual acotar todavía. `getCashClosureDetail` sí lo pasa
+ * (`shift.closedAt`, si existe).
  */
-async function computeShiftFinancials(shift: ICashClosure) {
+async function computeShiftFinancials(shift: ICashClosure, endDate?: Date) {
+  const createdAtFilter: any = { $gte: shift.openedAt };
+  if (endDate) createdAtFilter.$lte = endDate;
+
   const sales = await Sale.find({
     branchId: shift.branchId,
     cashierId: shift.cashierId,
-    createdAt: { $gte: shift.openedAt },
+    createdAt: createdAtFilter,
   });
 
   const cashSales = sales
@@ -43,7 +57,7 @@ async function computeShiftFinancials(shift: ICashClosure) {
       branchId: shift.branchId,
       registeredBy: shift.cashierId,
       category: "PETTY_CASH",
-      createdAt: { $gte: shift.openedAt },
+      createdAt: createdAtFilter,
     })
   ).reduce((acc, e) => acc + e.amount, 0);
 
@@ -62,7 +76,7 @@ async function computeShiftFinancials(shift: ICashClosure) {
       branchId: shift.branchId,
       registeredBy: shift.cashierId,
       paymentMethod: "CASH",
-      createdAt: { $gte: shift.openedAt },
+      createdAt: createdAtFilter,
     })
   ).reduce((acc, p) => acc + p.amount, 0);
 
@@ -420,6 +434,46 @@ export async function listCashClosuresAdmin(req: Request, res: Response) {
     pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
   });
+}
+
+/**
+ * GET /api/admin/cash-closures/:id/detail -> vista completa de un turno
+ * para el botón "Ver" de Finanzas > Caja (`CashClosureDetailModal.tsx`,
+ * ver punto 51 de admin-frontend/CLAUDE.md): apertura/cierre reales
+ * (`openedAt`/`closedAt`, los timestamps de cuando el cajero llenó
+ * "Iniciar turno"/"Cerrar turno" en el POS — ya vivían en el documento,
+ * no hubo que agregar nada para tenerlos), las dos verificaciones de
+ * inventario (`openingStockVerification`/`closingStockVerification`, con
+ * su `snapshot` completo — YA se guardaba en `openShift`/`closeShift` vía
+ * `buildStockSnapshot()`, tampoco hubo que agregar persistencia nueva) y
+ * el desglose de ventas por método de pago, recalculado en el momento con
+ * `computeShiftFinancials(shift, shift.closedAt)` en vez de leído de
+ * campos sueltos del documento — `cashSales`/`cashPurchases` nunca se
+ * guardaron como campos propios en `CashClosure` (solo `cardTotal`/
+ * `nequiTotal`/`appsTotal`/`pettyCashExpenses` sí), así que recalcular
+ * (acotado a `[openedAt, closedAt]`, no hasta "ahora") es más simple y
+ * más confiable que intentar reconstruirlos desde `systemCalculatedCash`.
+ */
+export async function getCashClosureDetail(req: Request, res: Response) {
+  const closure = await CashClosure.findById(req.params.id);
+  if (!closure) return res.status(404).json({ error: "Registro no encontrado" });
+
+  // El chequeo de sede va ANTES de popular `branchId` — una vez poblado
+  // deja de ser el `ObjectId` crudo (pasa a ser el documento de Branch
+  // completo), y `String(closure.branchId)` ya no da el hex esperado para
+  // comparar contra `req.admin.branchId` (mismo orden que
+  // `updateCashClosureAdmin`/`deleteCashClosureAdmin`, que nunca populan
+  // antes de este chequeo).
+  if (req.admin?.role === "MANAGER" && String(closure.branchId) !== req.admin.branchId) {
+    return res.status(403).json({ error: "No tienes acceso a este registro" });
+  }
+
+  const financials = await computeShiftFinancials(closure, closure.closedAt);
+
+  await closure.populate("branchId", "name");
+  await closure.populate("cashierId", "name");
+
+  return res.json({ closure, financials });
 }
 
 /**

@@ -20,6 +20,7 @@ import {
 } from "../controllers/purchaseController";
 import {
   listCashClosuresAdmin,
+  getCashClosureDetail,
   createCashClosureAdmin,
   updateCashClosureAdmin,
   deleteCashClosureAdmin,
@@ -133,6 +134,7 @@ router.delete("/expenses/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(del
 // Finanzas > Caja (aperturas/cierres de turno)
 router.get("/cash-closures/cashiers", asyncHandler(listCashiersForClosures));
 router.get("/cash-closures", asyncHandler(listCashClosuresAdmin));
+router.get("/cash-closures/:id/detail", asyncHandler(getCashClosureDetail));
 router.post("/cash-closures", requireRole("ADMIN", "MANAGER"), asyncHandler(createCashClosureAdmin));
 router.put("/cash-closures/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(updateCashClosureAdmin));
 router.delete("/cash-closures/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(deleteCashClosureAdmin));

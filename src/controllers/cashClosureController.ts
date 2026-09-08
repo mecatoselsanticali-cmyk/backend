@@ -453,6 +453,16 @@ export async function listCashClosuresAdmin(req: Request, res: Response) {
  * `nequiTotal`/`appsTotal`/`pettyCashExpenses` sí), así que recalcular
  * (acotado a `[openedAt, closedAt]`, no hasta "ahora") es más simple y
  * más confiable que intentar reconstruirlos desde `systemCalculatedCash`.
+ *
+ * También devuelve `purchases`/`expenses` (ver punto 55 de
+ * admin-frontend/CLAUDE.md) — listas completas (no solo el subconjunto en
+ * efectivo/caja menor que ya resume `financials`) de lo que el cajero
+ * registró durante el turno, misma ventana `[openedAt, closedAt]`. Cada
+ * `purchase` viene con `productId` poblado a `{_id, name}` — el flujo del
+ * cajero (`createPurchase`) exige producto desde que Compras se ligó a
+ * inventario (punto 16 de admin-frontend/CLAUDE.md), así que siempre
+ * viene presente acá; se popula para que el admin vea el producto real
+ * comprado, no solo el texto libre de `concept`.
  */
 export async function getCashClosureDetail(req: Request, res: Response) {
   const closure = await CashClosure.findById(req.params.id);
@@ -470,10 +480,31 @@ export async function getCashClosureDetail(req: Request, res: Response) {
 
   const financials = await computeShiftFinancials(closure, closure.closedAt);
 
+  // Compras y gastos que el cajero registró durante el turno (ver punto 55
+  // de admin-frontend/CLAUDE.md) — misma ventana `[openedAt, closedAt]` que
+  // `computeShiftFinancials`, pero SIN el `paymentMethod: "CASH"`/
+  // `category: "PETTY_CASH"` que esa función aplica solo para calcular el
+  // efectivo esperado: acá se quiere la lista completa de lo que el cajero
+  // registró (cualquier método de pago, cualquier categoría), no solo el
+  // subconjunto que afectó el efectivo de caja.
+  const createdAtFilter: any = { $gte: closure.openedAt };
+  if (closure.closedAt) createdAtFilter.$lte = closure.closedAt;
+
+  const [purchases, expenses] = await Promise.all([
+    Purchase.find({ branchId: closure.branchId, registeredBy: closure.cashierId, createdAt: createdAtFilter })
+      .sort({ createdAt: 1 })
+      .populate("productId", "name"),
+    Expense.find({
+      branchId: closure.branchId,
+      registeredBy: closure.cashierId,
+      createdAt: createdAtFilter,
+    }).sort({ createdAt: 1 }),
+  ]);
+
   await closure.populate("branchId", "name");
   await closure.populate("cashierId", "name");
 
-  return res.json({ closure, financials });
+  return res.json({ closure, financials, purchases, expenses });
 }
 
 /**

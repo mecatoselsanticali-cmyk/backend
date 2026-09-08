@@ -5,6 +5,7 @@ import {
   adminLogout,
   forgotPassword,
   resetPassword,
+  completeAdminOnboarding,
 } from "../controllers/authController";
 import { requireAdminAuth, requireRole } from "../middlewares/adminAuth";
 import { asyncHandler } from "../utils/asyncHandler";
@@ -70,6 +71,7 @@ router.post("/auth/reset-password", asyncHandler(resetPassword));
 router.use(requireAdminAuth);
 
 router.get("/auth/me", asyncHandler(adminMe));
+router.patch("/auth/onboarding-complete", asyncHandler(completeAdminOnboarding));
 
 // Dashboard
 router.get("/dashboard/kpis", asyncHandler(getDashboardKpis));

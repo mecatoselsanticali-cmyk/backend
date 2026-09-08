@@ -16,6 +16,11 @@ export interface IUser extends Document {
   // reutilizarlo (el correo solo lleva el token crudo, nunca persistido).
   resetPasswordTokenHash?: string;
   resetPasswordExpires?: Date;
+  // Tour de onboarding interactivo (ver PATCH /auth/onboarding-complete en
+  // authController.ts) — arranca en false para cualquier usuario nuevo
+  // (ADMIN/MANAGER/CASHIER comparten el mismo campo, el tour que se les
+  // muestra difiere solo en el frontend según `role`).
+  hasCompletedOnboarding: boolean;
   comparePin(rawPin: string): Promise<boolean>;
   comparePassword(rawPassword: string): Promise<boolean>;
 }
@@ -42,6 +47,7 @@ const UserSchema = new Schema<IUser>(
     active: { type: Boolean, default: true },
     resetPasswordTokenHash: { type: String, select: false },
     resetPasswordExpires: { type: Date, select: false },
+    hasCompletedOnboarding: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

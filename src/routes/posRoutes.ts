@@ -1,5 +1,11 @@
 import { Router } from "express";
-import { listActiveBranches, posLogin, posMe, posLogout } from "../controllers/authController";
+import {
+  listActiveBranches,
+  posLogin,
+  posMe,
+  posLogout,
+  completePosOnboarding,
+} from "../controllers/authController";
 import {
   getCatalog,
   createSale,
@@ -32,6 +38,11 @@ router.get("/auth/branches", asyncHandler(listActiveBranches));
 router.post("/auth/login", asyncHandler(posLogin));
 router.post("/auth/logout", asyncHandler(posLogout)); // limpia la cookie aunque ya haya expirado
 router.get("/auth/me", requirePosSession, asyncHandler(posMe));
+router.patch(
+  "/auth/onboarding-complete",
+  requirePosSession,
+  asyncHandler(completePosOnboarding)
+);
 
 // Catálogo
 router.get("/catalog", requirePosSession, asyncHandler(getCatalog));

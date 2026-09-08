@@ -818,3 +818,55 @@ llamarse — es solo guardar strings en memoria — así que el servidor
 arranca igual aunque estén vacías; el error real (`502 "No se pudo subir
 la imagen. Intenta de nuevo."`) recién aparece en el primer intento real
 de subir una foto, verificado en vivo antes de completar esta migración.
+
+### 52. Onboarding interactivo por rol — `User.hasCompletedOnboarding` + dos endpoints (uno por cada modelo de auth, ver punto 6)
+
+`User.ts` ganó un campo nuevo, `hasCompletedOnboarding: boolean` (default
+`false`) — compartido por los tres roles (ADMIN/MANAGER/CASHIER usan el
+mismo modelo `User`, ver punto 18), aunque el tour que el frontend muestra
+según ese flag difiere por rol (ver `admin-frontend/CLAUDE.md` y
+`admin-frontend/src/cajero/CLAUDE.md`).
+
+**No existe un único endpoint genérico `/api/users/onboarding-complete`**
+— el modelo de auth dual de este proyecto (JWT de admin vs. sesión PIN de
+cajero, ver punto 6 del CLAUDE.md raíz) usa cookies, middlewares y rutas
+completamente separadas (`/api/admin/*` con `requireAdminAuth` vs.
+`/api/pos/*` con `requirePosSession`), así que un endpoint neutral no
+podría autenticar ninguno de los dos casos sin mezclar los middlewares —
+algo que el CLAUDE.md raíz prohíbe explícitamente (punto 6: "No uses
+`requireAdminAuth` en rutas de POS ni viceversa"). En su lugar, dos
+endpoints paralelos en `authController.ts`, cada uno resolviendo el id de
+usuario desde su propio payload de sesión (`req.admin!.userId` /
+`req.posSession!.cashierId`), nunca del body:
+
+- `PATCH /api/admin/auth/onboarding-complete` (`completeAdminOnboarding`,
+  registrado en `adminRoutes.ts` después de `router.use(requireAdminAuth)`,
+  junto a `/auth/me`).
+- `PATCH /api/pos/auth/onboarding-complete` (`completePosOnboarding`,
+  `posRoutes.ts`, con `requirePosSession` explícito en la ruta — a
+  diferencia de `adminRoutes.ts`, `posRoutes.ts` no tiene un
+  `router.use(requirePosSession)` global, cada ruta lo declara aparte).
+
+Ambos hacen lo mismo (`User.findByIdAndUpdate(id, { hasCompletedOnboarding:
+true })`) y se llaman tanto al terminar el tour completo como al saltarlo
+("Omitir") — el frontend no distingue ambos casos al llamar al backend,
+ver el detalle de por qué en `admin-frontend/CLAUDE.md`.
+
+**`adminLogin`/`adminMe` y `posLogin`/`posMe` ahora incluyen
+`hasCompletedOnboarding` en su respuesta** — necesario para que el
+frontend sepa si debe disparar el tour sin una llamada aparte:
+- `adminMe` lo agrega a su `.select(...)` (el campo no tiene
+  `select: false`, así que ya venía por defecto, pero se lista explícito
+  igual que el resto de campos que sí se seleccionan a mano ahí).
+- `posMe` es un caso distinto: `PosSessionPayload` (el JWT del cajero) es
+  deliberadamente liviano (`cashierId`/`branchId`/`name`/`loginAt`, ver
+  `middlewares/posAuth.ts`) y nunca llevó datos de perfil que puedan
+  cambiar después de firmado el token — agregarle `hasCompletedOnboarding`
+  ahí lo dejaría desactualizado en cuanto el cajero completara el tour en
+  OTRA sesión de PIN sin que este JWT expirara. En vez de eso, `posMe`
+  ahora consulta `User.findById(session.cashierId)` en paralelo con el
+  lookup de `Branch` que ya hacía, igual que ya se apoya en la sesión para
+  `name`/`branchId` pero resuelve `hasCompletedOnboarding` fresco en cada
+  llamada.
+- `posLogin` sí lo agrega directo desde `matchedUser` (el documento que ya
+  trae de la consulta de PIN), sin una consulta aparte.

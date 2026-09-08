@@ -49,14 +49,22 @@ export async function adminLogin(req: Request, res: Response) {
   setAuthCookie(res, "admin_token", token, ms(ADMIN_TOKEN_TTL));
 
   return res.json({
-    user: { id: user._id, name: user.name, role: user.role, branchId: user.branchId },
+    user: {
+      id: user._id,
+      name: user.name,
+      role: user.role,
+      branchId: user.branchId,
+      hasCompletedOnboarding: user.hasCompletedOnboarding,
+    },
   });
 }
 
 /** GET /api/admin/auth/me -> perfil del admin autenticado (verifica la cookie) */
 export async function adminMe(req: Request, res: Response) {
   const admin = req.admin!;
-  const user = await User.findById(admin.userId).select("name email role branchId active");
+  const user = await User.findById(admin.userId).select(
+    "name email role branchId active hasCompletedOnboarding"
+  );
 
   if (!user || !user.active) {
     return res.status(401).json({ error: "Sesión inválida" });
@@ -68,7 +76,20 @@ export async function adminMe(req: Request, res: Response) {
     email: user.email,
     role: user.role,
     branchId: user.branchId,
+    hasCompletedOnboarding: user.hasCompletedOnboarding,
   });
+}
+
+/**
+ * PATCH /api/admin/auth/onboarding-complete -> marca el tour de onboarding
+ * como visto para el admin/gerente autenticado. Se llama tanto al terminar
+ * el tour como al saltarlo ("Omitir") — en ambos casos no debe volver a
+ * aparecer en el próximo login.
+ */
+export async function completeAdminOnboarding(req: Request, res: Response) {
+  const admin = req.admin!;
+  await User.findByIdAndUpdate(admin.userId, { hasCompletedOnboarding: true });
+  return res.json({ hasCompletedOnboarding: true });
 }
 
 /** POST /api/admin/auth/logout -> limpia la cookie httpOnly */
@@ -197,14 +218,25 @@ export async function posLogin(req: Request, res: Response) {
   setAuthCookie(res, "cashier_token", token, ms(POS_TOKEN_TTL));
 
   return res.json({
-    cashier: { id: matchedUser._id, name: matchedUser.name },
+    cashier: {
+      id: matchedUser._id,
+      name: matchedUser.name,
+      hasCompletedOnboarding: matchedUser.hasCompletedOnboarding,
+    },
   });
 }
 
 /** GET /api/pos/auth/me -> sesión actual del cajero (verifica la cookie) */
 export async function posMe(req: Request, res: Response) {
   const session = req.posSession!;
-  const branch = await Branch.findById(session.branchId).select("name");
+  // `hasCompletedOnboarding` no viaja en el JWT del cajero (payload liviano,
+  // ver PosSessionPayload) — se consulta fresco cada vez, igual que el
+  // nombre de la sede, para reflejar si se completó el tour en OTRA sesión
+  // de PIN sin esperar a que este JWT expire.
+  const [branch, user] = await Promise.all([
+    Branch.findById(session.branchId).select("name"),
+    User.findById(session.cashierId).select("hasCompletedOnboarding"),
+  ]);
 
   return res.json({
     cashierId: session.cashierId,
@@ -212,6 +244,7 @@ export async function posMe(req: Request, res: Response) {
     branchName: branch?.name || "",
     name: session.name,
     loginAt: session.loginAt,
+    hasCompletedOnboarding: user?.hasCompletedOnboarding ?? false,
   });
 }
 
@@ -219,4 +252,15 @@ export async function posMe(req: Request, res: Response) {
 export async function posLogout(_req: Request, res: Response) {
   clearAuthCookie(res, "cashier_token");
   return res.status(204).send();
+}
+
+/**
+ * PATCH /api/pos/auth/onboarding-complete -> marca el tour de onboarding
+ * como visto para el cajero autenticado. Mismo criterio que
+ * `completeAdminOnboarding`: se llama al terminar el tour Y al saltarlo.
+ */
+export async function completePosOnboarding(req: Request, res: Response) {
+  const session = req.posSession!;
+  await User.findByIdAndUpdate(session.cashierId, { hasCompletedOnboarding: true });
+  return res.json({ hasCompletedOnboarding: true });
 }

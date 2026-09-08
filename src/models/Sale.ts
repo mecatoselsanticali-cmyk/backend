@@ -37,6 +37,13 @@ export interface ISale extends Document {
   paymentMethod: PaymentMethod;
   paymentStatus: PaymentStatus;
   settlementDate?: Date; // se llena al confirmar el pago (ver confirmSalePayment)
+  // Número de comprobante/transferencia que el admin escribe al confirmar el
+  // pago (individual o en bloque, ver confirmSalePayment/confirmSalePaymentBulk
+  // en adminController.ts) — puramente informativo, de referencia para
+  // conciliar contra el extracto bancario. Opcional: confirmar un pago nunca
+  // exigió este dato antes de que existiera la confirmación en bloque, y
+  // seguir sin exigirlo evita romper el flujo de confirmar una sola venta.
+  settlementReference?: string;
   subtotal: number;
   tax: number;
   total: number;
@@ -95,6 +102,7 @@ const SaleSchema = new Schema<ISale>(
       index: true,
     },
     settlementDate: Date,
+    settlementReference: String,
     subtotal: { type: Number, required: true },
     tax: { type: Number, required: true },
     total: { type: Number, required: true },

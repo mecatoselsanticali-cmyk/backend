@@ -6,11 +6,17 @@ import { Sale, resolvePaymentStatus } from "../models/Sale";
 import { User } from "../models/User";
 import { AccountPayable, AccountReceivable } from "../models/Accounts";
 import { Expense, IExpense } from "../models/Expense";
+import { Purchase } from "../models/Purchase";
 import bcrypt from "bcryptjs";
 import { Types } from "mongoose";
 import { dianService } from "../services/dianService";
 import { enqueueSaleForDianEmission } from "../queues/dianQueue";
-import { syncInventoryToSheets, logSaleToSheets, logExpenseToSheets } from "../utils/sheetsSync";
+import {
+  syncInventoryToSheets,
+  logSaleToSheets,
+  logExpenseToSheets,
+  logPaymentConfirmationToSheets,
+} from "../utils/sheetsSync";
 import {
   startOfLocalDay,
   endOfLocalDay,
@@ -489,6 +495,12 @@ const PAYMENT_METHOD_LABELS: Record<string, string> = {
  * Notas Crédito" de `paymentMethods`: no hay modelo de crédito ni de
  * notas crédito en este sistema, así que quedan en 0 a propósito — son
  * filas requeridas por el spec del dashboard, no datos fabricados.
+ *
+ * `summary` también trae `totalPurchases`/`totalExpenses`/`profitability`
+ * (ver punto 54 de CLAUDE.md) — mismo rango/sede que el resto de este
+ * endpoint, agregados de `Purchase`/`Expense` sin filtro de estado (ninguno
+ * de los dos modelos tiene un concepto de "cancelado", a diferencia de
+ * `Sale.status`).
  */
 export async function getDashboardMetrics(req: Request, res: Response) {
   const branchId = resolveBranchFilter(req);
@@ -511,6 +523,9 @@ export async function getDashboardMetrics(req: Request, res: Response) {
   const expenseMatch: any = { createdAt: { $gte: start, $lte: end } };
   if (branchObjectId) expenseMatch.branchId = branchObjectId;
 
+  const purchaseMatch: any = { createdAt: { $gte: start, $lte: end } };
+  if (branchObjectId) purchaseMatch.branchId = branchObjectId;
+
   // Widget 1 solo tiene sentido por HORA cuando el rango es un único día
   // (Hoy/Ayer) — agregar por hora a través de VARIOS días junta el mismo
   // horario de días distintos en una sola barra, lo que no responde "¿qué
@@ -519,7 +534,7 @@ export async function getDashboardMetrics(req: Request, res: Response) {
   const isSingleDay = !from || !to || String(from) === String(to);
   const timelineGranularity: "hour" | "day" = isSingleDay ? "hour" : "day";
 
-  const [summaryAgg, timelineAgg, topProductsAgg, expensesAgg, paymentMethodsAgg] = await Promise.all([
+  const [summaryAgg, timelineAgg, topProductsAgg, expensesAgg, paymentMethodsAgg, purchasesAgg] = await Promise.all([
     Sale.aggregate([
       { $match: saleMatch },
       {
@@ -561,6 +576,7 @@ export async function getDashboardMetrics(req: Request, res: Response) {
       { $match: saleMatch },
       { $group: { _id: "$paymentMethod", amount: { $sum: "$total" } } },
     ]),
+    Purchase.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, sum: { $sum: "$amount" } } }]),
   ]);
 
   const summary = summaryAgg[0] || { grossTotal: 0, impoconsumoTotal: 0, netTotal: 0, totalTransactions: 0 };
@@ -629,6 +645,15 @@ export async function getDashboardMetrics(req: Request, res: Response) {
     percentage: totalExpenses > 0 ? Math.round((e.amount / totalExpenses) * 1000) / 10 : 0,
   }));
 
+  const totalPurchases = purchasesAgg[0]?.sum || 0;
+  // Rentabilidad = ventas netas - compras - gastos, del mismo rango/sede
+  // que el resto del dashboard. No es una utilidad contable formal (no
+  // resta costo de mercancía vendida vía kardex, que no existe todavía —
+  // ver "Pendiente conocido" en el CLAUDE.md raíz sobre el BOM/recipe sin
+  // descuento de stock) — es la lectura simple "cuánto entró menos cuánto
+  // salió" que el negocio pidió para este widget.
+  const profitability = summary.netTotal - totalPurchases - totalExpenses;
+
   const amountByMethod = new Map(paymentMethodsAgg.map((m: any) => [m._id, m.amount]));
   const paymentMethods = [
     ...Object.entries(PAYMENT_METHOD_LABELS).map(([key, label]) => ({
@@ -648,6 +673,9 @@ export async function getDashboardMetrics(req: Request, res: Response) {
       netTotal: summary.netTotal,
       averageTicket,
       totalTransactions: summary.totalTransactions,
+      totalPurchases,
+      totalExpenses,
+      profitability,
     },
     salesTimeline,
     timelineGranularity,
@@ -658,7 +686,7 @@ export async function getDashboardMetrics(req: Request, res: Response) {
 }
 
 export async function listSales(req: Request, res: Response) {
-  const { from, to, dianStatus, orderType, category, paymentMethod, cashierId, search } = req.query;
+  const { from, to, dianStatus, orderType, category, paymentMethod, paymentStatus, cashierId, search } = req.query;
   const branchId = resolveBranchFilter(req);
   const filter: any = {};
   // Casteados a `Types.ObjectId` desde el principio — `$match` en el
@@ -673,6 +701,11 @@ export async function listSales(req: Request, res: Response) {
   if (orderType) filter.orderType = orderType;
   if (category) filter.category = category;
   if (paymentMethod) filter.paymentMethod = paymentMethod;
+  // Filtro nuevo para la vista de "pendientes DiDi/Rappi" del miércoles de
+  // liquidación (ver punto 53 de admin-frontend/CLAUDE.md) — combinado con
+  // paymentMethod=DELIVERY_APP en el frontend, aunque este filtro por sí
+  // solo también sirve para cualquier otro uso futuro de paymentStatus.
+  if (paymentStatus) filter.paymentStatus = paymentStatus;
   if (cashierId) filter.cashierId = new Types.ObjectId(String(cashierId));
   // `startOfLocalDay`/`endOfLocalDay` (ver punto 33/24 de CLAUDE.md) — antes
   // esto usaba `new Date(string)` a secas, que interpreta el string como
@@ -1027,14 +1060,72 @@ export async function confirmSalePayment(req: Request, res: Response) {
     return res.status(400).json({ error: "Esta venta no tiene un pago pendiente de confirmar" });
   }
 
+  const { settlementReference } = req.body as { settlementReference?: string };
+
   sale.paymentStatus = "COMPLETED";
   sale.settlementDate = new Date();
+  if (settlementReference) sale.settlementReference = settlementReference;
   await sale.save();
+
+  logPaymentConfirmationToSheets(sale).catch((err) => {
+    console.error(`[confirmSalePayment] No se pudo sincronizar la confirmación de ${sale._id} a Sheets:`, err);
+  });
 
   await sale.populate("branchId", "name address phone");
   await sale.populate("cashierId", "name");
 
   return res.json(sale);
+}
+
+/**
+ * PATCH /api/admin/sales/confirm-payment-bulk
+ * `{ saleIds: string[], settlementReference?: string }` — confirmación en
+ * bloque del pago de varias ventas DELIVERY_APP a la vez (miércoles de
+ * liquidación DiDi/Rappi, ver punto 53 de admin-frontend/CLAUDE.md). Mismo
+ * criterio fila por fila que `confirmSalePayment` (arriba) — no es una
+ * sola query masiva de Mongo (`updateMany`), porque cada venta necesita su
+ * propio chequeo de sede (MANAGER) y su propio estado antes de aceptarla;
+ * un `updateMany` con un filtro compartido no puede reportar CUÁL id
+ * falló y por qué, y esa granularidad es justo lo que la UI necesita para
+ * mostrarle al admin cuáles sí y cuáles no se confirmaron.
+ */
+export async function confirmSalePaymentBulk(req: Request, res: Response) {
+  const { saleIds, settlementReference } = req.body as { saleIds?: string[]; settlementReference?: string };
+
+  if (!Array.isArray(saleIds) || saleIds.length === 0) {
+    return res.status(400).json({ error: "Selecciona al menos una venta para confirmar" });
+  }
+
+  const confirmed: string[] = [];
+  const skipped: { id: string; reason: string }[] = [];
+
+  for (const id of saleIds) {
+    const sale = await Sale.findById(id);
+    if (!sale) {
+      skipped.push({ id, reason: "Venta no encontrada" });
+      continue;
+    }
+    if (req.admin?.role === "MANAGER" && String(sale.branchId) !== req.admin.branchId) {
+      skipped.push({ id, reason: "Sin acceso a esta venta" });
+      continue;
+    }
+    if (sale.paymentStatus !== "PENDING_PAYMENT") {
+      skipped.push({ id, reason: "No tiene un pago pendiente de confirmar" });
+      continue;
+    }
+
+    sale.paymentStatus = "COMPLETED";
+    sale.settlementDate = new Date();
+    if (settlementReference) sale.settlementReference = settlementReference;
+    await sale.save();
+    confirmed.push(id);
+
+    logPaymentConfirmationToSheets(sale).catch((err) => {
+      console.error(`[confirmSalePaymentBulk] No se pudo sincronizar la confirmación de ${sale._id} a Sheets:`, err);
+    });
+  }
+
+  return res.json({ confirmed, skipped });
 }
 
 /**

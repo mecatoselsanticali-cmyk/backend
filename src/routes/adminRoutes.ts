@@ -48,6 +48,7 @@ import {
   updateSaleAdmin,
   cancelSaleAdmin,
   confirmSalePayment,
+  confirmSalePaymentBulk,
   listPayables,
   createPayable,
   listReceivables,
@@ -110,6 +111,11 @@ router.post("/sales", requireRole("ADMIN", "MANAGER"), asyncHandler(createSaleAd
 router.put("/sales/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(updateSaleAdmin));
 router.post("/sales/:id/cancel", requireRole("ADMIN", "MANAGER"), asyncHandler(cancelSaleAdmin));
 router.patch("/sales/:id/confirm-payment", requireRole("ADMIN", "MANAGER"), asyncHandler(confirmSalePayment));
+router.patch(
+  "/sales/confirm-payment-bulk",
+  requireRole("ADMIN", "MANAGER"),
+  asyncHandler(confirmSalePaymentBulk)
+);
 
 // Compras (vista consolidada de lo registrado por los cajeros)
 router.get("/purchases", asyncHandler(listPurchasesAdmin));

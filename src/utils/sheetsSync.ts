@@ -69,6 +69,9 @@ export async function syncInventoryToSheets(productId: unknown) {
  * Rappi todavía no liquidadas. Como esta tabla es append-only (ver
  * docs/GOOGLE_SHEETS_INTEGRATION.md), confirmar el pago después NO reescribe
  * esta fila — la hoja solo refleja el estado al momento de la venta.
+ * `logPaymentConfirmationToSheets` (más abajo) es cómo Sheets SÍ se entera
+ * de una confirmación posterior, como una fila nueva de ajuste en vez de
+ * reescribir esta.
  */
 export async function logSaleToSheets(sale: ISale) {
   const [branch, cashier] = await Promise.all([branchName(sale.branchId), userName(sale.cashierId)]);
@@ -77,6 +80,34 @@ export async function logSaleToSheets(sale: ISale) {
     movementType: "SALE",
     category: sale.category,
     descriptionOrId: String(sale._id),
+    amount: sale.total,
+    paymentMethod: sale.paymentMethod,
+    paymentStatus: sale.paymentStatus,
+    cashierUser: cashier,
+  });
+}
+
+/**
+ * Registra la CONFIRMACIÓN de pago de una venta DELIVERY_APP (individual o
+ * en bloque, ver punto 53 de admin-frontend/CLAUDE.md) como una fila NUEVA
+ * en OPERATIONAL_LOGS — no reescribe la fila original de `logSaleToSheets`
+ * (esa tabla es append-only, ver la nota ahí arriba). `movementType:
+ * "PAYMENT_CONFIRMATION"` es un valor nuevo que `Code.gs` acepta sin
+ * cambios (`handleOperationalLog` no valida `movementType` contra una
+ * lista fija, mismo caso ya documentado para `"STOCK_LOSS"`, ver punto 45
+ * en admin-frontend/src/cajero/CLAUDE.md). `descriptionOrId` referencia la
+ * venta original y el comprobante (si el admin lo escribió) para poder
+ * cruzar ambas filas a mano en la hoja.
+ */
+export async function logPaymentConfirmationToSheets(sale: ISale) {
+  const [branch, cashier] = await Promise.all([branchName(sale.branchId), userName(sale.cashierId)]);
+  await enqueueSheetsSync("LOG_TRANSACTION", {
+    branch,
+    movementType: "PAYMENT_CONFIRMATION",
+    category: sale.category,
+    descriptionOrId: sale.settlementReference
+      ? `Venta ${String(sale._id)} — comprobante ${sale.settlementReference}`
+      : `Venta ${String(sale._id)}`,
     amount: sale.total,
     paymentMethod: sale.paymentMethod,
     paymentStatus: sale.paymentStatus,

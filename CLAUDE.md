@@ -819,6 +819,60 @@ arranca igual aunque estén vacías; el error real (`502 "No se pudo subir
 la imagen. Intenta de nuevo."`) recién aparece en el primer intento real
 de subir una foto, verificado en vivo antes de completar esta migración.
 
+### 58. `GET /health` — probe liviano sin tocar Mongo, para mantener el backend despierto en Render y evitar cold starts
+
+Complementa al punto 43 de `admin-frontend/CLAUDE.md` (que ya documentaba
+el cold start de Render como la causa real de "el login se siente
+lento") con la otra mitad de la estrategia: en vez de solo minimizar
+cuánto duele un cold start cuando ocurre (una sola llamada de auth en vez
+de 4), este punto es sobre evitar que el cold start ocurra para empezar.
+
+- **`app.get("/health", ...)`** (`app.ts`, montado ANTES de
+  `/api/pos`/`/api/admin` y de cualquier middleware de auth) responde
+  `{ status: "ok", service: "mecatos-backend" }` de forma síncrona — sin
+  ninguna consulta a Mongo. A propósito: el objetivo de este endpoint es
+  probar únicamente "¿el proceso de Express está vivo y respondiendo?",
+  no "¿la base de datos también está sana?" — lo segundo sería un chequeo
+  distinto (y más caro/más lento de ejecutar en cada ping), que nadie pidió
+  todavía. Si en el futuro se necesita un health check más profundo
+  (verificar conexión a Mongo/Redis), que sea un endpoint aparte
+  (`/health/deep` o similar) — no le agregues una consulta a este, perdería
+  el propósito de ser la opción liviana y rápida para un ping externo
+  frecuente.
+- **No pasa por CORS ni por ningún middleware de auth** — no hace falta:
+  CORS es un mecanismo del navegador (bloquea peticiones cross-origin
+  hechas DESDE una página web), y un servicio de monitoreo externo
+  (UptimeRobot, Better Uptime, un cron de curl, etc.) no es un navegador —
+  le pega directo al endpoint por HTTP, sin `Origin` que `cors()` necesite
+  validar. No se agregó `CORS_ORIGIN` ni ninguna excepción para esto,
+  simplemente no aplica.
+- **El problema real que esto mitiga**: en el plan gratuito/starter de
+  Render (ver puntos 40/41 sobre otras limitaciones ya encontradas en
+  producción con este mismo proveedor), una instancia sin tráfico entra en
+  suspensión tras un período de inactividad, y la SIGUIENTE petición real
+  (ej. el primer `GET /api/admin/auth/me` de un admin abriendo la app) paga
+  el costo completo de "despertar" el contenedor antes de poder responder
+  — decenas de segundos, no milisegundos. El punto 43 ya redujo cuánto se
+  siente ese costo (1 llamada de auth en cascada en vez de 4 en paralelo/
+  serie), pero la forma de que la mayoría de los usuarios reales NUNCA
+  sienta un cold start es que la instancia jamás llegue a dormirse.
+- **Estrategia recomendada (configuración externa, no algo que viva en
+  este repo)**: apuntar un servicio de monitoreo externo (ej. UptimeRobot,
+  cuyo plan gratuito soporta un intervalo mínimo de 5 minutos) a `GET
+  https://<dominio-del-backend>/health` con ese intervalo — por debajo del
+  umbral de inactividad que usa Render para suspender una instancia, así
+  el servicio nunca la ve pasar el tiempo suficiente sin tráfico como para
+  dormirse. Esto es configuración del panel de UptimeRobot/del proveedor
+  de hosting, no código de este repo — no hay ningún archivo de este
+  proyecto que lo automatice ni lo garantice; si se cambia de proveedor de
+  monitoreo o de hosting, hay que volver a configurar el ping ahí, no acá.
+- **Esto es una mitigación, no una garantía absoluta**: un redeploy, un
+  reinicio manual, o un lapso en el que el servicio de monitoreo mismo
+  esté caído, igual puede resultar en un cold start ocasional — el punto
+  43 sigue siendo la defensa real para ESE caso (que la espera, cuando
+  pasa, sea lo más corta posible), este punto solo reduce cuán seguido
+  pasa.
+
 ### 52. Onboarding interactivo por rol — `User.hasCompletedOnboarding` + dos endpoints (uno por cada modelo de auth, ver punto 6)
 
 `User.ts` ganó un campo nuevo, `hasCompletedOnboarding: boolean` (default

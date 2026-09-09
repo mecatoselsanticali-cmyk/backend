@@ -749,6 +749,24 @@ destinatario elige "mostrar imágenes"). Si se agrega otro correo
 transaccional a futuro que también necesite el logo, reutiliza
 `LOGO_URL` en vez de armar la URL de nuevo en un tercer archivo.
 
+**Bug real encontrado y corregido — `LOGO_URL` apuntando al `.webp` en vez
+del `.png` se veía roto en el correo real:** alguien cambió esta URL a
+`logo-santi-trimmed.webp` (el archivo más liviano, el que sí usa la web
+para el logo animado de `LogoLoader.tsx`) — en el navegador WebP funciona
+sin problema, pero en un cliente de correo real el logo llegó con bandas
+de color y artefactos en vez del logo limpio (confirmado con una captura
+real del correo de recuperación de contraseña). No fue un error de carga
+(el `<img>` sí "cargaba", solo se veía mal) — varios clientes de correo
+(Outlook de escritorio en particular, y algunos proxies de imágenes de
+webmail) no decodifican WebP correctamente. Mismo tipo de límite ya
+encontrado con `pdfkit`/`exceljs` al generar los reportes (punto 56 de
+`admin-frontend/CLAUDE.md`) — ahí WebP directamente no funciona (tira
+error), acá "funciona" pero se ve mal, una variante más traicionera del
+mismo problema porque no hay ningún error que lo delate. Revertido al
+`.png` — si en el futuro alguien vuelve a "optimizar" este `LOGO_URL` a
+WebP por su tamaño más chico, no lo hagas: para HTML de correo, el `.png`
+es el único formato verificado que se ve bien en todos los clientes.
+
 ### 41. Fotos de producto migraron de disco local a Cloudinary — `utils/imageProcessing.ts` ya no existe
 
 **Antes**: `uploadController.ts` (`uploadProductImage`, `POST

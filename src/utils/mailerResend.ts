@@ -40,7 +40,18 @@ const FROM_ADDRESS = process.env.RESEND_FROM || "Mecatos el Santi <onboarding@re
 // cliente de correo real (nadie fuera de esta máquina puede pedirle una
 // imagen a tu propio localhost), pero el resto del correo sigue
 // funcionando igual (el `alt` queda como texto de respaldo).
-const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.webp`;
+//
+// A propósito el `.png`, NO el `.webp` que también existe en esa misma
+// carpeta — verificado en un correo real: varios clientes de correo
+// (Outlook de escritorio en particular, y algunos proxies de imágenes de
+// webmail) no decodifican WebP correctamente y lo renderizan con bandas
+// de color/artefactos en vez del logo real, aunque el `<img>` "cargue"
+// sin error. Mismo tipo de limitación ya encontrada con `pdfkit`/
+// `exceljs` (punto 56 de admin-frontend/CLAUDE.md) — ahí WebP directamente
+// no funciona, acá "funciona" pero se ve roto. El `.png` es el formato
+// probado en los tres contextos de este proyecto que sirven el logo por
+// URL/archivo (login, recibo impreso, correo).
+const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.png`;
 
 export async function sendPasswordResetEmail(to: string, name: string, resetUrl: string) {
   const { error } = await resend.emails.send({

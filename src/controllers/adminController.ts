@@ -95,6 +95,73 @@ export async function updateBranch(req: Request, res: Response) {
 
 /* --------------------------- Productos --------------------------- */
 
+/**
+ * Productos activos que están en 0 unidades (SIEMPRE crítico, sin
+ * importar `minStock` — 0 unidades es objetivamente crítico exista o no
+ * un umbral configurado) o que tienen un `minStock > 0` configurado
+ * (opt-in, ver `Product.minStock`) y el stock actual está en o por
+ * debajo de ese umbral — usado tanto por el widget "Stock Crítico" del
+ * Dashboard (`getDashboardMetrics`) como por el filtro `lowStockOnly` de
+ * `listProducts` (el CTA "Ir a Inventario" de ese mismo widget), ver
+ * punto 62 de admin-frontend/CLAUDE.md. Compartido en un solo lugar para
+ * que ambos consumidores usen exactamente el mismo criterio de "qué es
+ * crítico" — no tendría sentido que el widget mostrará 3 productos y el
+ * filtro de Inventario mostrará una lista distinta para el mismo
+ * criterio.
+ *
+ * **`minStock` sigue siendo opt-in solo para el caso "bajo pero no
+ * cero"** — un producto sin umbral configurado y con, digamos, 3
+ * unidades no se considera crítico (nadie pidió que se monitoree), pero
+ * ese mismo producto en 0 unidades sí, sin que nadie tenga que
+ * configurar nada primero. Esto se agregó tras un reporte real: un
+ * producto recién creado (sin `minStock` seteado todavía) llegó a 0
+ * unidades y no aparecía en el widget — la regla original evaluaba TODO
+ * el criterio contra `minStock`, así que un producto sin umbral nunca
+ * podía ser crítico sin importar cuánto stock tuviera.
+ *
+ * Por eso ya no se puede prefiltrar con `minStock: { $gt: 0 }` en la
+ * consulta de `Product` — hace falta evaluar TODO producto activo contra
+ * su stock real para saber si llegó a 0, sin importar su `minStock`.
+ *
+ * Arranca desde `Product` (no desde `ProductStock`, a diferencia de
+ * `buildProductStockSummary`) para que un producto SIN ningún documento
+ * de `ProductStock` (0 unidades reales, el caso más crítico posible)
+ * también aparezca — si arrancara del lado de `ProductStock`, ese
+ * producto ni siquiera tendría una fila con la que empezar.
+ *
+ * `branchId` opcional: con sede, compara contra el stock de ESA sede;
+ * sin sede ("todas las sedes"), contra la suma en todas — mismo criterio
+ * que ya usa la columna "Stock" de Inventario.tsx
+ * (`branchStock`/`totalStock`).
+ */
+async function getCriticalStockProducts(branchId?: string) {
+  const products = await Product.find({ active: true })
+    .select("name sku minStock")
+    .lean();
+  if (products.length === 0) return [];
+
+  const stockFilter: any = { productId: { $in: products.map((p) => p._id) } };
+  if (branchId) stockFilter.branchId = new Types.ObjectId(branchId);
+  const stocks = await ProductStock.find(stockFilter).lean();
+
+  const quantityByProduct = new Map<string, number>();
+  for (const s of stocks) {
+    const key = String(s.productId);
+    quantityByProduct.set(key, (quantityByProduct.get(key) || 0) + s.quantity);
+  }
+
+  return products
+    .map((p) => ({
+      productId: String(p._id),
+      name: p.name,
+      sku: p.sku,
+      quantity: quantityByProduct.get(String(p._id)) || 0,
+      minStock: p.minStock || 0,
+    }))
+    .filter((p) => p.quantity <= 0 || (p.minStock > 0 && p.quantity <= p.minStock))
+    .sort((a, b) => a.quantity - b.quantity);
+}
+
 export async function listProducts(req: Request, res: Response) {
   const { category, search, includeInactive, branchId } = req.query;
   const filter: any = {};
@@ -110,7 +177,18 @@ export async function listProducts(req: Request, res: Response) {
   // lado. El filtro se arma ANTES de paginar para que `total`/`totalPages`
   // reflejen el conjunto ya filtrado, no el catálogo completo.
   let branchStockByProduct: Map<string, number> | null = null;
-  if (branchId) {
+
+  // "Solo stock bajo" (ver punto 62 de admin-frontend/CLAUDE.md — CTA "Ir a
+  // Inventario" del widget de Stock Crítico del Dashboard) — a propósito
+  // es una rama SEPARADA del filtro normal por sede de abajo, no un filtro
+  // que se combine con él: ese excluye productos con `quantity: 0` en la
+  // sede (asume "sin stock ahí = no se puede vender, no mostrar"), pero acá
+  // el caso más importante de ver es justo el de 0 unidades.
+  if (req.query.lowStockOnly === "true") {
+    const critical = await getCriticalStockProducts(branchId ? String(branchId) : undefined);
+    filter._id = { $in: critical.map((c) => new Types.ObjectId(c.productId)) };
+    branchStockByProduct = new Map(critical.map((c) => [c.productId, c.quantity]));
+  } else if (branchId) {
     const branchStocks = await ProductStock.find({
       branchId: String(branchId),
       quantity: { $gt: 0 },
@@ -207,6 +285,64 @@ export async function addProductStock(req: Request, res: Response) {
 
   syncInventoryToSheets(product._id as Types.ObjectId).catch((err) => {
     console.error(`[addProductStock] No se pudo sincronizar inventario de ${product._id} a Sheets:`, err);
+  });
+
+  return res.json(await buildProductStockSummary(product._id as Types.ObjectId));
+}
+
+/**
+ * PUT /api/admin/products/:id/stock -> FIJA el stock de un producto en N
+ * sedes al valor exacto que mande el admin (ver punto 60 de
+ * admin-frontend/CLAUDE.md) — a propósito `$set`, no `$inc` como
+ * `addProductStock` de arriba: el admin está corrigiendo/declarando
+ * "esto es lo que hay" (mismo criterio que `adjustStockCount` en
+ * `cashClosureController.ts`, la verificación de stock del cajero al
+ * abrir/cerrar turno — es el otro único lugar del proyecto que usa `$set`
+ * sobre `ProductStock`), no reportando un cambio relativo. Pensado para
+ * cuando el negocio ya tenía stock físico antes de empezar a usar el
+ * sistema, o para corregir un conteo que se desincronizó — un caso que
+ * `addProductStock` (aditivo) y las compras/ventas normales no cubren.
+ *
+ * Solo ADMIN, nunca MANAGER (ver `requireRole("ADMIN")` en
+ * `adminRoutes.ts`) — fijar el stock a cualquier número sin dejar rastro
+ * de compra/venta/merma detrás es una herramienta más sensible que
+ * `addProductStock` (que un GERENTE sí puede usar, es equivalente a
+ * comprar sin registrar el gasto). `0` es un valor válido a propósito
+ * (a diferencia de `addProductStock`, que descarta asignaciones `<= 0`
+ * porque sumar 0 no tiene efecto) — fijar el stock de una sede en 0 es
+ * una operación real y con sentido acá.
+ */
+export async function setProductStock(req: Request, res: Response) {
+  const product = await Product.findById(req.params.id);
+  if (!product) return res.status(404).json({ error: "Producto no encontrado" });
+
+  const allocations: { branchId?: string; quantity?: number }[] = req.body.allocations || [];
+  const valid = allocations
+    .filter((a) => a.branchId && Number.isFinite(Number(a.quantity)) && Number(a.quantity) >= 0)
+    .map((a) => ({ branchId: a.branchId as string, quantity: Math.floor(Number(a.quantity)) }));
+
+  if (valid.length === 0) {
+    return res.status(400).json({ error: "Debes indicar la cantidad para al menos una sede" });
+  }
+
+  const branchIds = valid.map((a) => a.branchId);
+  const validBranchCount = await Branch.countDocuments({ _id: { $in: branchIds }, status: true });
+  if (validBranchCount !== new Set(branchIds).size) {
+    return res.status(400).json({ error: "Una o más sedes no son válidas" });
+  }
+
+  await Promise.all(
+    valid.map((a) =>
+      ProductStock.findOneAndUpdate(
+        { productId: product._id, branchId: a.branchId },
+        { $set: { quantity: a.quantity } },
+        { upsert: true }
+      )
+    )
+  );
+
+  syncInventoryToSheets(product._id as Types.ObjectId).catch((err) => {
+    console.error(`[setProductStock] No se pudo sincronizar inventario de ${product._id} a Sheets:`, err);
   });
 
   return res.json(await buildProductStockSummary(product._id as Types.ObjectId));
@@ -509,9 +645,18 @@ export async function getDashboardKpis(req: Request, res: Response) {
   });
 }
 
+// "CARD" (Tarjetas/Datáfono) se quitó a propósito de este mapa — el
+// negocio no recibe pagos con datáfono, nunca (ver punto 61 de
+// admin-frontend/CLAUDE.md). Único punto de verdad de la fila "Transacciones
+// por método de pago" del Dashboard (`getDashboardMetrics` más abajo) — con
+// esto quitado, esa fila deja de aparecer ahí. `Sale.paymentMethod` en el
+// modelo SIGUE aceptando "CARD" como valor histórico (no se tocó el enum,
+// ver Sale.ts) — si una venta vieja con ese método cae dentro del rango de
+// fechas elegido, su monto sigue sumado en `netTotal`/`grossTotal`
+// (ninguno de los dos filtra por método), solo deja de tener su propia
+// fila en este desglose puntual.
 const PAYMENT_METHOD_LABELS: Record<string, string> = {
   CASH: "Efectivo",
-  CARD: "Tarjetas / Datáfono",
   NEQUI: "Nequi / Daviplata",
   DELIVERY_APP: "Delivery Apps (Rappi/DiDi)",
 };
@@ -527,10 +672,16 @@ const PAYMENT_METHOD_LABELS: Record<string, string> = {
  * (8%) por producto hoy (todas las ventas usan una tasa plana del 8%, ver
  * punto de arquitectura sobre el placeholder de impuesto en CLAUDE.md) —
  * se devuelven en 0 en vez de inventar un cálculo que no existe realmente.
- * Lo mismo para las filas "Crédito / Cuentas por Cobrar" y "Devoluciones /
- * Notas Crédito" de `paymentMethods`: no hay modelo de crédito ni de
- * notas crédito en este sistema, así que quedan en 0 a propósito — son
- * filas requeridas por el spec del dashboard, no datos fabricados.
+ * La fila "Devoluciones / Notas Crédito" de `paymentMethods` siempre es 0
+ * — no hay modelo de notas crédito en este sistema, así que queda en 0 a
+ * propósito (era una fila requerida por el spec original del dashboard,
+ * no un dato fabricado). "Cuentas por cobrar (DiDi)" (antes "Crédito /
+ * Cuentas por Cobrar", también en 0 fijo) ya NO es un placeholder — ver
+ * punto 62 de admin-frontend/CLAUDE.md: ahora suma el `total` real de las
+ * ventas DELIVERY_APP con `paymentStatus: "PENDING_PAYMENT"` dentro del
+ * mismo rango/sede que el resto del dashboard (ver punto 34 de este mismo
+ * archivo, backend/CLAUDE.md, sobre por qué las ventas de apps de
+ * domicilio nacen pendientes de pago).
  *
  * `summary` también trae `totalPurchases`/`totalExpenses`/`profitability`
  * (ver punto 54 de CLAUDE.md) — mismo rango/sede que el resto de este
@@ -570,7 +721,16 @@ export async function getDashboardMetrics(req: Request, res: Response) {
   const isSingleDay = !from || !to || String(from) === String(to);
   const timelineGranularity: "hour" | "day" = isSingleDay ? "hour" : "day";
 
-  const [summaryAgg, timelineAgg, topProductsAgg, expensesAgg, paymentMethodsAgg, purchasesAgg] = await Promise.all([
+  const [
+    summaryAgg,
+    timelineAgg,
+    topProductsAgg,
+    expensesAgg,
+    paymentMethodsAgg,
+    purchasesAgg,
+    pendingDidiAgg,
+    criticalStock,
+  ] = await Promise.all([
     Sale.aggregate([
       { $match: saleMatch },
       {
@@ -613,6 +773,24 @@ export async function getDashboardMetrics(req: Request, res: Response) {
       { $group: { _id: "$paymentMethod", amount: { $sum: "$total" } } },
     ]),
     Purchase.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, sum: { $sum: "$amount" } } }]),
+    // "Cuentas por cobrar (DiDi)" en `paymentMethods` más abajo — dinero
+    // de ventas por app de domicilios del rango/sede elegidos que
+    // TODAVÍA no se confirma como liquidado (ver punto 34 de
+    // backend/CLAUDE.md: DELIVERY_APP nace "PENDING_PAYMENT", un admin lo
+    // confirma a mano cuando ve el depósito real en el banco). Mismo
+    // `saleMatch` que el resto del dashboard (rango de fechas + sede +
+    // `status: "ACTIVE"`), con el filtro extra de método/estado de pago.
+    Sale.aggregate([
+      { $match: { ...saleMatch, paymentMethod: "DELIVERY_APP", paymentStatus: "PENDING_PAYMENT" } },
+      { $group: { _id: null, amount: { $sum: "$total" } } },
+    ]),
+    // Widget "Stock Crítico" (ver punto 62 de admin-frontend/CLAUDE.md) —
+    // a diferencia de todo lo demás en este Promise.all, NO depende de
+    // `from`/`to`: el stock es una foto del momento actual, no algo que
+    // ocurrió dentro de un rango de fechas (mismo criterio ya usado para
+    // el inventario del reporte financiero, punto 56). Solo respeta la
+    // sede elegida.
+    getCriticalStockProducts(branchId),
   ]);
 
   const summary = summaryAgg[0] || { grossTotal: 0, impoconsumoTotal: 0, netTotal: 0, totalTransactions: 0 };
@@ -691,12 +869,13 @@ export async function getDashboardMetrics(req: Request, res: Response) {
   const profitability = summary.netTotal - totalPurchases - totalExpenses;
 
   const amountByMethod = new Map(paymentMethodsAgg.map((m: any) => [m._id, m.amount]));
+  const pendingDidiAmount = pendingDidiAgg[0]?.amount || 0;
   const paymentMethods = [
     ...Object.entries(PAYMENT_METHOD_LABELS).map(([key, label]) => ({
       method: label,
       amount: amountByMethod.get(key) || 0,
     })),
-    { method: "Crédito / Cuentas por Cobrar", amount: 0 },
+    { method: "Cuentas por cobrar (DiDi)", amount: pendingDidiAmount },
     { method: "Devoluciones / Notas Crédito", amount: 0 },
   ];
 
@@ -718,6 +897,7 @@ export async function getDashboardMetrics(req: Request, res: Response) {
     topProducts,
     expensesByCategory,
     paymentMethods,
+    criticalStock,
   });
 }
 

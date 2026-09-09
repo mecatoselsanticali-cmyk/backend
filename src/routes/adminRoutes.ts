@@ -38,6 +38,7 @@ import {
   deleteProduct,
   getProductStock,
   addProductStock,
+  setProductStock,
   listUsers,
   createUser,
   getDashboardKpis,
@@ -90,6 +91,7 @@ router.put("/products/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(update
 router.delete("/products/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(deleteProduct));
 router.get("/products/:id/stock", asyncHandler(getProductStock));
 router.post("/products/:id/stock", requireRole("ADMIN", "MANAGER"), asyncHandler(addProductStock));
+router.put("/products/:id/stock", requireRole("ADMIN"), asyncHandler(setProductStock));
 
 // Carga de imagen de producto (se usa desde el modal de Inventario)
 router.post(

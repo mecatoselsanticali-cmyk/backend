@@ -21,6 +21,14 @@ export interface IProduct extends Document {
   recipe: IRecipeItem[];
   active: boolean;
   branchStock?: number; // opcional si se maneja stock por sede en otra colección
+  // Umbral de stock mínimo para la alerta de "Stock Crítico" del Dashboard
+  // (ver punto 62 de admin-frontend/CLAUDE.md) — `0` (default) significa
+  // "sin monitorear": el producto nunca aparece en la alerta hasta que un
+  // admin le asigna un umbral explícito arriba de 0. Es un solo número
+  // GLOBAL por producto, no por sede — comparado contra el stock de la
+  // sede seleccionada (o la suma de todas si no hay ninguna elegida),
+  // mismo criterio que ya usa la columna "Stock" de Inventario.tsx.
+  minStock: number;
 }
 
 const ModifierSchema = new Schema<IModifier>(
@@ -47,6 +55,7 @@ const ProductSchema = new Schema<IProduct>(
     modifiers: { type: [ModifierSchema], default: [] },
     recipe: { type: [RecipeItemSchema], default: [] },
     active: { type: Boolean, default: true },
+    minStock: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );

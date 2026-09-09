@@ -667,11 +667,14 @@ const PAYMENT_METHOD_LABELS: Record<string, string> = {
  * getDashboardKpis (arriba, fijo al día de hoy), este acepta un rango de
  * fechas (`from`/`to`) elegido por el filtro superior del dashboard.
  *
- * `discountTotal` e `ivaTotal` en el resumen siempre son 0 — este sistema
- * no tiene un modelo de descuentos ni distingue IVA (19%) de Impoconsumo
- * (8%) por producto hoy (todas las ventas usan una tasa plana del 8%, ver
- * punto de arquitectura sobre el placeholder de impuesto en CLAUDE.md) —
- * se devuelven en 0 en vez de inventar un cálculo que no existe realmente.
+ * `discountTotal` en el resumen siempre es 0 — este sistema no tiene un
+ * modelo de descuentos, se devuelve en 0 en vez de inventar un cálculo
+ * que no existe realmente. El negocio no es responsable de declarar/
+ * cobrar impuestos (IVA/INC) — decisión explícita — así que este resumen
+ * ya no trae `impoconsumoTotal`/`ivaTotal` en absoluto (antes ambos
+ * quedaban en 0/un placeholder del 8%; se quitaron del todo en vez de
+ * mantenerlos fijos en 0, ver `Sale.tax` en el modelo y los 3 puntos que
+ * crean una venta en posController.ts/adminController.ts).
  * La fila "Devoluciones / Notas Crédito" de `paymentMethods` siempre es 0
  * — no hay modelo de notas crédito en este sistema, así que queda en 0 a
  * propósito (era una fila requerida por el spec original del dashboard,
@@ -737,7 +740,6 @@ export async function getDashboardMetrics(req: Request, res: Response) {
         $group: {
           _id: null,
           grossTotal: { $sum: "$subtotal" },
-          impoconsumoTotal: { $sum: "$tax" },
           netTotal: { $sum: "$total" },
           totalTransactions: { $sum: 1 },
         },
@@ -793,7 +795,7 @@ export async function getDashboardMetrics(req: Request, res: Response) {
     getCriticalStockProducts(branchId),
   ]);
 
-  const summary = summaryAgg[0] || { grossTotal: 0, impoconsumoTotal: 0, netTotal: 0, totalTransactions: 0 };
+  const summary = summaryAgg[0] || { grossTotal: 0, netTotal: 0, totalTransactions: 0 };
   const averageTicket = summary.totalTransactions > 0 ? summary.netTotal / summary.totalTransactions : 0;
 
   const salesTimeline: { label: string; total: number }[] = [];
@@ -883,8 +885,6 @@ export async function getDashboardMetrics(req: Request, res: Response) {
     summary: {
       grossTotal: summary.grossTotal,
       discountTotal: 0,
-      impoconsumoTotal: summary.impoconsumoTotal,
-      ivaTotal: 0,
       netTotal: summary.netTotal,
       averageTicket,
       totalTransactions: summary.totalTransactions,
@@ -1079,8 +1079,13 @@ export async function createSaleAdmin(req: Request, res: Response) {
   });
 
   const subtotal = saleItems.reduce((acc, it) => acc + it.total, 0);
-  const tax = Math.round(subtotal * 0.08);
-  const total = saleItems.reduce((acc, it) => acc + it.total, 0);;
+  // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
+  // decisión explícita, `tax` se deja fijo en 0 en vez del 8% placeholder
+  // que existía antes (mismo criterio que createSale/syncOfflineSales en
+  // posController.ts). El campo se mantiene en `Sale` solo por
+  // compatibilidad de lectura con ventas históricas.
+  const tax = 0;
+  const total = saleItems.reduce((acc, it) => acc + it.total, 0);
 
   /**
    * 

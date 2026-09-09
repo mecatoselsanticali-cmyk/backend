@@ -152,9 +152,12 @@ export async function createSale(req: Request, res: Response) {
   }
 
   const subtotal = items.reduce((acc: number, it: any) => acc + it.subtotal, 0);
-  // Simplificación: tasa de impuesto promedio ponderada podría calcularse por producto;
-  // aquí se aplica un placeholder del 8% (INC) configurable por producto en versiones futuras.
-  const tax = Math.round(subtotal * 0.08);
+  // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
+  // decisión explícita, `tax` se deja fijo en 0 en vez de calcular el 8%
+  // placeholder que existía antes. El campo se mantiene en `Sale` (no se
+  // borra del schema) solo por compatibilidad de lectura con ventas
+  // históricas que sí tienen un valor real ahí.
+  const tax = 0;
   const total = subtotal;
 
   //const requiresNominal = dianService.requiresNominalInvoice(total);
@@ -315,8 +318,14 @@ export async function syncOfflineSales(req: Request, res: Response) {
       }
 
       const subtotal = raw.items.reduce((acc: number, it: any) => acc + it.subtotal, 0);
-      const tax = Math.round(subtotal * 0.08);
-      const total = subtotal + tax;
+      // Sin impuestos (ver el mismo criterio en createSale, arriba en este
+      // archivo) — esto también corrige una inconsistencia real que ya
+      // existía acá: este drenaje legado sumaba `tax` a `total`
+      // (`subtotal + tax`), a diferencia de `createSale`/`createSaleAdmin`,
+      // que siempre dejaron `total = subtotal` sin sumar el impuesto. Con
+      // `tax` en 0 la diferencia deja de importar en la práctica.
+      const tax = 0;
+      const total = subtotal;
       const requiresNominal = dianService.requiresNominalInvoice(total);
 
       const sale = await Sale.create({

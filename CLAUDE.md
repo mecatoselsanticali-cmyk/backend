@@ -1055,3 +1055,93 @@ frontend sepa si debe disparar el tour sin una llamada aparte:
   llamada.
 - `posLogin` sí lo agrega directo desde `matchedUser` (el documento que ya
   trae de la consulta de PIN), sin una consulta aparte.
+
+### 65. El negocio no es responsable de declarar/cobrar impuestos — `Sale.tax` se deja fijo en 0, ya no hay placeholder del 8%
+
+Pedido explícito: el negocio no tiene que declarar IVA/INC, así que dejó
+de tener sentido seguir calculando (ni mostrando) un impuesto sobre cada
+venta. **Esto resultó ser un cambio de bajo riesgo sobre lo que el
+cliente paga** — investigado antes de tocar nada: en los 3 sitios que
+crean una venta (`posController.createSale`/`syncOfflineSales`,
+`adminController.createSaleAdmin`), `total` YA era igual a `subtotal`
+desde antes de este cambio — el campo `tax` (`Math.round(subtotal *
+0.08)`, un placeholder de "Impuesto Nacional al Consumo" que nunca se
+terminó de configurar por producto) se calculaba y se guardaba, pero
+**nunca se sumaba a lo que el cliente pagaba** — era puramente un número
+informativo/de reporte. La única excepción real era
+`syncOfflineSales` (el drenaje legado de tickets viejos de Dexie, ver
+punto 8 de `admin-frontend/src/cajero/CLAUDE.md`), que sí hacía `total =
+subtotal + tax` — una inconsistencia real con los otros dos sitios,
+corregida de paso acá (con `tax` en 0 la diferencia deja de importar en
+la práctica, pero la fórmula ya quedó igual a los otros dos).
+
+- **Los 3 sitios que crean una venta** ahora dejan `const tax = 0;`
+  (antes `Math.round(subtotal * 0.08)`) — `total`/`subtotal` no
+  cambiaron de fórmula en ninguno de los tres.
+- **`Sale.tax` NO se borró del schema** — sigue existiendo (`backend/
+  src/models/Sale.ts`), solo que de ahora en adelante siempre se
+  escribe en 0. Se mantiene por compatibilidad de LECTURA con ventas
+  históricas que sí tienen un valor real de impuesto guardado (mismo
+  criterio que `Sale.paymentMethod` conservando `"CARD"` en su enum tras
+  quitarlo de la UI, ver punto 61 de `admin-frontend/CLAUDE.md`) — no
+  hay ninguna razón de negocio para reescribir/purgar esas ventas viejas,
+  y borrar el campo del schema no aporta nada, solo arriesga romper la
+  lectura de documentos ya guardados.
+- **`getDashboardMetrics` perdió `impoconsumoTotal`/`ivaTotal` del todo**
+  (antes `impoconsumoTotal: { $sum: "$tax" }` en la agregación, más
+  `ivaTotal: 0` fijo en la respuesta) — investigado antes de quitarlos:
+  ninguno de los dos se leía ya en ningún lado del frontend (el widget
+  que los mostraba, "Ticket promedio", se había reemplazado por "Stock
+  Crítico" en un punto anterior, ver punto 62 de `admin-frontend/
+  CLAUDE.md` — el campo simplemente quedó huérfano en la respuesta del
+  endpoint desde entonces, sin que nadie lo notara porque no rompía
+  nada). `discountTotal` (que también vive en esa misma respuesta, fijo
+  en 0) **no se tocó** — no es un campo de impuestos, sigue ahí por el
+  mismo motivo que siempre (este sistema no tiene modelo de descuentos).
+- **Limpieza de código muerto relacionado, encontrado en el camino** (ver
+  el recibo imprimible en punto 19 de `admin-frontend/CLAUDE.md`): un
+  `<select>`/`<input>` de "Tipo de impuesto"/"Tasa de
+  impuesto" en `ProductModal.tsx` que llevaba tiempo comentado
+  (`{/** ... */}`, nunca se enviaba al backend ni existe `taxType`/
+  `taxRate` en el schema de `Product`), un bloque de resumen
+  Subtotal/Impuesto también comentado en `SaleModal.tsx`, una columna
+  "Impuesto" comentada en el `<thead>` de `Inventario.tsx` (ya
+  documentada como código muerto en el punto 36 de `admin-frontend/
+  CLAUDE.md`, ahora eliminada de raíz en vez de solo dejarla comentada),
+  y `taxType`/`taxRate` en los 4 productos de `backend/src/utils/
+  seed.ts` (mismo problema: ni siquiera existen en el schema de
+  `Product`, `Product.create` los descartaba en silencio).
+- **No se tocó `dianService.ts`** — la integración con la DIAN sigue
+  siendo un mock (ver "Pendiente conocido" en el `CLAUDE.md` raíz) y
+  nunca calculó ni leyó ningún campo de impuesto.
+
+Verificado en vivo (backend + admin-frontend + print-server real,
+los tres corriendo a la vez, no mockeado): crear una venta real desde
+"+ Agregar venta" guarda `tax: 0` en Mongo (confirmado con una consulta
+directa); el recibo en pantalla (`SaleReceipt.tsx`) ya no muestra
+ninguna línea de "Impuesto (INC)"/IVA/Impoconsumo, solo Subtotal y
+Total (iguales entre sí); el botón "Vista previa" pega de verdad al
+`print-server` real corriendo en `:4001` y la página HTML que devuelve
+tampoco trae esa línea. Venta de prueba y el stock que descontó
+revertidos al terminar — no queda ningún dato de prueba en la base
+real.
+
+**Bug real encontrado en el camino, NO corregido a propósito (fuera de
+alcance de este cambio) — `createSaleAdmin` arma cada ítem de la venta
+con un campo `total`, no `subtotal`.** `ISaleItem` (`Sale.ts`) declara
+`subtotal: number` como el nombre real del campo en el schema, pero el
+`.map(...)` que arma `saleItems` en `createSaleAdmin`
+(`adminController.ts`) devuelve `{ productId, name, quantity, price,
+total: product.price * quantity }` — sin ningún `subtotal`. El
+`subtotal`/`total` a nivel de VENTA (`sale.subtotal`/`sale.total`) salen
+bien igual, porque se sacan sumando `it.total` con un `.reduce(...)`
+aparte — el bug es solo en el campo por ÍTEM, que queda `undefined` en
+Mongo. Efecto visible: en cualquier venta creada por este flujo (no por
+`posController.createSale`, que si arma `subtotal` correctamente por
+ítem), la columna "Subtotal" de cada producto en el recibo
+(`SaleReceipt.tsx`, ambas copias) y en el ticket térmico impreso
+muestra `$NaN` en vez del monto real. Encontrado verificando este mismo
+punto (una venta de prueba real mostró `$NaN` en su único ítem) — no se
+corrigió porque es un bug distinto, sin relación con impuestos, y tocar
+la construcción de ítems de venta amerita su propio cambio deliberado,
+no colarlo dentro de esta corrección.

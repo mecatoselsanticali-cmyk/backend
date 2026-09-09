@@ -60,24 +60,18 @@ async function seed() {
       sku: "PAN-001",
       category: "Panadería",
       price: 2500,
-      taxType: "INC",
-      taxRate: 0.08,
     },
     {
       name: "Buñuelo",
       sku: "PAN-002",
       category: "Panadería",
       price: 2000,
-      taxType: "INC",
-      taxRate: 0.08,
     },
     {
       name: "Café Americano",
       sku: "BEB-001",
       category: "Bebidas",
       price: 4000,
-      taxType: "INC",
-      taxRate: 0.08,
       modifiers: [{ name: "Extra shot", extraPrice: 1500 }],
     },
     {
@@ -85,8 +79,6 @@ async function seed() {
       sku: "SAN-001",
       category: "Comidas",
       price: 9500,
-      taxType: "INC",
-      taxRate: 0.08,
       modifiers: [
         { name: "Sin cebolla", extraPrice: 0 },
         { name: "Extra queso", extraPrice: 2000 },

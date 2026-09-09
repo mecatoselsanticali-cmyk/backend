@@ -45,6 +45,14 @@ export interface ISale extends Document {
   // seguir sin exigirlo evita romper el flujo de confirmar una sola venta.
   settlementReference?: string;
   subtotal: number;
+  // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
+  // decisión explícita, los 3 sitios que crean una venta (posController.
+  // createSale/syncOfflineSales, adminController.createSaleAdmin) ya
+  // dejan este campo fijo en 0 en vez de calcular el 8% placeholder que
+  // existía antes. Se mantiene en el schema (no se borra) solo por
+  // compatibilidad de lectura con ventas históricas que sí tienen un
+  // valor real acá — no se muestra en ningún recibo/reporte nuevo (ver
+  // punto 65 de admin-frontend/CLAUDE.md).
   tax: number;
   total: number;
   customer?: ISaleCustomer;

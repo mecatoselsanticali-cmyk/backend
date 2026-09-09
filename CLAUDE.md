@@ -873,6 +873,119 @@ de 4), este punto es sobre evitar que el cold start ocurra para empezar.
   pasa, sea lo más corta posible), este punto solo reduce cuán seguido
   pasa.
 
+### 59. Correo de bienvenida al crear un ADMIN/MANAGER — reutiliza el mecanismo de "olvidé mi contraseña", nunca manda la contraseña en texto plano
+
+Pedido original: que crear un usuario ADMIN/MANAGER desde Personal
+dispare un correo de bienvenida con sus credenciales, reutilizando el
+proveedor de correo ya configurado (Resend, ver punto 40). **Se desvió a
+propósito de un detalle del pedido original** — antes de implementar se le
+preguntó explícitamente al usuario si el correo debía mostrar la
+contraseña en texto plano que el admin asignó al crear la cuenta, o si
+debía reusar el link seguro de "olvidé mi contraseña" en su lugar; se
+confirmó la segunda opción. Mandar contraseñas por correo es un
+anti-patrón de seguridad conocido (queda guardada indefinidamente en una
+bandeja de entrada, pasa por la infraestructura de un tercero, sin
+ninguna garantía de que ese canal sea seguro extremo a extremo) — y este
+proyecto ya tenía el mecanismo correcto construido y probado en
+producción (el flujo de recuperación de contraseña), así que "reutilizar
+el servicio de correo existente" se interpretó como reutilizar TODO el
+mecanismo (token + link), no solo la librería de envío.
+
+- **`backend/src/utils/passwordResetToken.ts`** (archivo nuevo) —
+  `generateResetToken()` extrae la generación de token que antes vivía
+  inline solo dentro de `forgotPassword` (`authController.ts`):
+  `crypto.randomBytes(32)` crudo, se persiste solo su hash SHA-256, con 1
+  hora de vencimiento (`RESET_TOKEN_TTL_MS`, ahora exportado desde acá en
+  vez de ser una constante local de `authController.ts`). Se extrajo a un
+  util compartido porque **dos flujos distintos generan este mismo tipo
+  de token y ambos son consumidos por el mismo endpoint**
+  (`POST /auth/reset-password`) — conviene que no puedan desincronizarse
+  en formato o duración. `forgotPassword` se migró a usar este helper
+  (mismo comportamiento exacto, sin cambios funcionales, ver el diff
+  mínimo en `authController.ts`); `resetPassword` no se tocó — ya era
+  agnóstico de quién generó el token.
+- **`createUser`** (`adminController.ts`), justo después de
+  `User.create(doc)`: si `role` es `ADMIN` o `MANAGER` **y** el usuario
+  tiene `email` (un cajero nunca lo tiene), genera un token con
+  `generateResetToken()`, lo guarda en el mismo documento recién creado
+  (`user.resetPasswordTokenHash`/`user.resetPasswordExpires` +
+  `user.save()`) y dispara `sendWelcomeEmail(...)` con el link armado
+  (`${FRONTEND_URL}/reset-password?token=<crudo>`) — el mismo endpoint
+  `POST /auth/reset-password` que ya usa "olvidé mi contraseña" resuelve
+  este link sin ningún cambio de backend adicional, porque no le importa
+  si el token se originó ahí o en `createUser`.
+  - **Fire-and-forget, igual que la sincronización con Google Sheets**
+    (punto 21) — a diferencia de `forgotPassword` (que si SÍ espera el
+    envío y responde 500 si falla, porque ahí el usuario hizo clic
+    esperando un correo), acá un fallo de envío no debe tumbar la
+    creación del usuario, que ya se guardó con éxito en Mongo. Errores se
+    loguean con `console.error`, nunca se propagan a la respuesta HTTP —
+    el pedido original lo exigía explícitamente ("Async Delivery...
+    ensure email dispatch delays do not block the HTTP API response").
+  - **Bug real evitado, no solo corregido — fuga de
+    `resetPasswordTokenHash`/`resetPasswordExpires` en la respuesta**:
+    ambos campos tienen `select: false` en el modelo, pero eso solo
+    afecta a QUERIES nuevas contra Mongo — como el bloque de arriba los
+    asigna directo sobre el documento `user` ya en memoria (antes de que
+    su propio `.save()` async termine), `user.toObject()` sí los incluye.
+    `createUser` ya borraba `password`/`pin` de `safeUser` antes de
+    responder (patrón preexistente); se agregó el mismo `delete` para
+    estos dos campos nuevos — sin eso, la respuesta de creación (JSON al
+    frontend) habría filtrado el HASH del token (no el token crudo en sí,
+    pero sigue siendo un detalle de implementación que no debería salir
+    en una respuesta de API).
+- **`sendWelcomeEmail(to, name, role, setupUrl)`** (nueva, junto a
+  `sendPasswordResetEmail` en `utils/mailerResend.ts`, mismo archivo, no
+  uno aparte) — mismo estilo visual que el correo de recuperación (logo
+  centrado vía `LOGO_URL`, franja de marca `#ea580c`, botón CTA con el
+  mismo degradé): saludo personalizado, anuncio del rol
+  ("Administrador"/"Gerente de sede" — mismas etiquetas que
+  `roleLabels` en `Sidebar.tsx`, duplicadas acá por ser paquetes
+  separados), una caja con el correo de acceso (sin contraseña) y un
+  botón **"Configurar mi contraseña"** que lleva al link seguro — el
+  pedido original especificaba un botón "Acceder al Sistema" apuntando
+  directo a `/login`, pero eso ya no tiene sentido con el diseño elegido:
+  el usuario nuevo todavía no tiene una contraseña que él mismo conozca
+  hasta usar el link, así que el CTA describe la acción real que hace.
+- **Limitación conocida, no resuelta acá — cuenta de Resend en modo de
+  prueba** (ver punto 40): sin un dominio propio verificado, Resend solo
+  entrega correos a la dirección con la que se creó la cuenta de Resend —
+  a cualquier otro destinatario (cualquier ADMIN/MANAGER real que no sea
+  esa cuenta) el envío falla con un error real (no silencioso,
+  `sendWelcomeEmail` lo relanza igual que `sendPasswordResetEmail`), que
+  el `.catch()` de `createUser` atrapa y solo loguea. Verificado en vivo:
+  `POST /api/admin/users` con un correo de prueba devolvió `201` con el
+  usuario creado correctamente y sin campos sensibles filtrados, y
+  `resetPasswordTokenHash`/`resetPasswordExpires` quedaron persistidos en
+  Mongo (confirmado con una consulta directa) — el envío del correo en sí
+  no se pudo confirmar en este entorno por la restricción de Resend, pero
+  toda la lógica previa al envío (creación de usuario, generación y
+  persistencia del token, no-bloqueo de la respuesta) funciona. Hasta que
+  se verifique un dominio propio en el dashboard de Resend, este correo de
+  bienvenida solo llegará de verdad a la bandeja de la cuenta que creó el
+  API key de Resend — el resto de administradores/gerentes nuevos no
+  recibirán nada (la creación del usuario funciona igual, solo el correo
+  no llega).
+- **Frontend — `UserModal.tsx` (`admin-frontend`) ya no pide contraseña al
+  CREAR un ADMIN/MANAGER, pedido explícito de cierre de este mismo punto**:
+  el campo "Contraseña" solo se muestra cuando `isEditing` es verdadero —
+  al crear, en su lugar hay una nota informativa ("Le enviaremos un correo
+  a esta dirección para que configure su propia contraseña de acceso")
+  justo donde antes vivía el input. La validación de `submit()` se
+  simplificó a juego: ya no exige `form.password` en ningún caso (ni al
+  crear ni al editar) — solo el correo sigue siendo obligatorio para
+  ADMIN/MANAGER, mismo mensaje de error sin importar `isEditing`. **Editar
+  un ADMIN/MANAGER existente no cambió en nada** — el campo sigue ahí,
+  opcional, con el mismo placeholder "Dejar en blanco para no cambiarla" y
+  el mismo comportamiento de backend (`updateUser` solo hashea/actualiza
+  la contraseña si `password` viene en el body, ver `if (password)
+  doc.password = ...`). El toast de éxito al crear un ADMIN/MANAGER (no un
+  CASHIER) ahora menciona el correo de bienvenida, para que quede claro
+  qué pasó sin tener que adivinarlo. Verificado en vivo con Playwright:
+  0 inputs de tipo `password` en el modal de creación tanto para
+  `MANAGER` como para `ADMIN`, exactamente 1 en el modal de edición de un
+  gerente existente.
+
 ### 52. Onboarding interactivo por rol — `User.hasCompletedOnboarding` + dos endpoints (uno por cada modelo de auth, ver punto 6)
 
 `User.ts` ganó un campo nuevo, `hasCompletedOnboarding: boolean` (default

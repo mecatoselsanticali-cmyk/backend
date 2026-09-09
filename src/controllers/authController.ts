@@ -12,10 +12,10 @@ import { setAuthCookie, clearAuthCookie } from "../utils/cookies";
 // `mailer.ts` sigue intacto — para revertir, solo cambia este import de
 // vuelta a "../utils/mailer".
 import { sendPasswordResetEmail } from "../utils/mailerResend";
+import { generateResetToken } from "../utils/passwordResetToken";
 
 const ADMIN_TOKEN_TTL = process.env.JWT_EXPIRES_IN || "8h";
 const POS_TOKEN_TTL = process.env.POS_SESSION_EXPIRES_IN || "12h";
-const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
 /** POST /api/admin/auth/login  { email, password } */
 export async function adminLogin(req: Request, res: Response) {
@@ -125,9 +125,9 @@ export async function forgotPassword(req: Request, res: Response) {
 
   // Se guarda el HASH del token, nunca el token crudo (ver el comentario en
   // User.ts) — el correo lleva el crudo, que solo existe en memoria acá.
-  const rawToken = crypto.randomBytes(32).toString("hex");
-  user.resetPasswordTokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-  user.resetPasswordExpires = new Date(Date.now() + RESET_TOKEN_TTL_MS);
+  const { rawToken, tokenHash, expires } = generateResetToken();
+  user.resetPasswordTokenHash = tokenHash;
+  user.resetPasswordExpires = expires;
   await user.save();
 
   const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5174";

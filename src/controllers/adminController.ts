@@ -23,6 +23,8 @@ import {
   getStartOfTodayColombia,
   COLOMBIA_TIME_ZONE,
 } from "../utils/dateRange";
+import { sendWelcomeEmail } from "../utils/mailerResend";
+import { generateResetToken } from "../utils/passwordResetToken";
 
 /**
  * Un GERENTE (MANAGER) siempre queda restringido a su propia sede (la del
@@ -386,9 +388,43 @@ export async function createUser(req: Request, res: Response) {
   if (pin) doc.pin = await bcrypt.hash(pin, 10);
 
   const user = await User.create(doc);
+
+  // Correo de bienvenida para ADMIN/MANAGER nuevos (ver punto 59 de
+  // backend/CLAUDE.md) — nunca para CASHIER (no tiene `email`, usa PIN).
+  // Fire-and-forget, mismo criterio que la sincronización con Google
+  // Sheets (punto 21): un fallo de envío no debe tumbar la creación del
+  // usuario, que ya se guardó con éxito en Mongo. A propósito NO manda la
+  // contraseña en texto plano que el admin haya asignado — reutiliza el
+  // mecanismo de "olvidé mi contraseña" (`generateResetToken()`) para que
+  // el nuevo usuario configure su propia contraseña por un link de un solo
+  // uso, en vez de exponerla por correo.
+  if ((role === "ADMIN" || role === "MANAGER") && user.email) {
+    const { rawToken, tokenHash, expires } = generateResetToken();
+    user.resetPasswordTokenHash = tokenHash;
+    user.resetPasswordExpires = expires;
+    user
+      .save()
+      .then(() => {
+        const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5174";
+        const setupUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+        return sendWelcomeEmail(user.email!, user.name, role, setupUrl);
+      })
+      .catch((err) => {
+        console.error(`[createUser] No se pudo enviar el correo de bienvenida a ${user.email}:`, err);
+      });
+  }
+
   const safeUser = user.toObject();
   delete safeUser.password;
   delete safeUser.pin;
+  // `resetPasswordTokenHash`/`resetPasswordExpires` tienen `select: false`
+  // en el modelo, pero eso solo afecta a QUERIES nuevas — como el bloque de
+  // arriba los asigna directo sobre este mismo documento en memoria (antes
+  // de que termine su propio `.save()` async), `toObject()` sí los incluye.
+  // Se borran acá igual que `password`/`pin`, para no filtrar el hash del
+  // token (ni su expiración) en la respuesta de creación.
+  delete safeUser.resetPasswordTokenHash;
+  delete safeUser.resetPasswordExpires;
 
   return res.status(201).json(safeUser);
 }

@@ -40,7 +40,7 @@ const FROM_ADDRESS = process.env.RESEND_FROM || "Mecatos el Santi <onboarding@re
 // cliente de correo real (nadie fuera de esta máquina puede pedirle una
 // imagen a tu propio localhost), pero el resto del correo sigue
 // funcionando igual (el `alt` queda como texto de respaldo).
-const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.png`;
+const LOGO_URL = `${process.env.FRONTEND_URL || "http://localhost:5174"}/img/logo-santi-trimmed.webp`;
 
 export async function sendPasswordResetEmail(to: string, name: string, resetUrl: string) {
   const { error } = await resend.emails.send({
@@ -63,6 +63,68 @@ export async function sendPasswordResetEmail(to: string, name: string, resetUrl:
         </p>
         <p>Este enlace vence en 1 hora. Si tú no pediste este cambio, puedes ignorar este correo — tu contraseña actual sigue funcionando.</p>
         <p style="color: #737373; font-size: 12px;">Si el botón no funciona, copia y pega este enlace en tu navegador: ${resetUrl}</p>
+      </div>
+    `,
+  });
+
+  if (error) {
+    throw new Error(error.message || "Resend no pudo enviar el correo");
+  }
+}
+
+// "Administrador"/"Gerente de sede" — mismas etiquetas en español que ya
+// usa `roleLabels` en `admin-frontend/src/layout/Sidebar.tsx`; no se
+// importa desde ahí (backend/frontend son paquetes separados) así que se
+// repite acá, mismo criterio que el resto de mapas de etiquetas chicos
+// duplicados en este proyecto.
+const ROLE_LABELS: Record<string, string> = {
+  ADMIN: "Administrador",
+  MANAGER: "Gerente de sede",
+};
+
+/**
+ * Correo de bienvenida para un ADMIN/MANAGER recién creado desde Personal
+ * (ver punto 59 de backend/CLAUDE.md) — dispara `createUser`
+ * (`adminController.ts`), nunca `updateUser` (edición de un usuario
+ * existente). A propósito NO lleva la contraseña en texto plano que el
+ * admin haya asignado al crear el usuario — mismo motivo que cualquier
+ * "no mandes contraseñas por correo": el correo no es un canal que este
+ * proyecto pueda garantizar seguro extremo a extremo (queda guardado en la
+ * bandeja de entrada indefinidamente, pasa por la infraestructura de
+ * Resend, etc.). En su lugar, reutiliza el mecanismo de "olvidé mi
+ * contraseña" ya existente (`generateResetToken()`,
+ * `utils/passwordResetToken.ts`) — el link de este correo es válido para
+ * el mismo endpoint `POST /auth/reset-password` que ya usa esa
+ * recuperación, sin ningún cambio de backend adicional.
+ */
+export async function sendWelcomeEmail(to: string, name: string, role: string, setupUrl: string) {
+  const roleLabel = ROLE_LABELS[role] || role;
+
+  const { error } = await resend.emails.send({
+    from: FROM_ADDRESS,
+    to,
+    subject: "Bienvenido a Mecatos el Santi",
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
+        <img src="${LOGO_URL}" alt="Mecatos el Santi" style="display: block; width: 160px; max-width: 100%; margin: 0 auto 16px;" />
+        <h2 style="color: #ea580c; text-align: center;">Mecatos el Santi</h2>
+        <p>Hola ${name},</p>
+        <p>Te damos la bienvenida — te registraron como <strong>${roleLabel}</strong> en el panel administrativo de Mecatos el Santi.</p>
+        <div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; padding: 12px 16px; margin: 16px 0;">
+          <p style="margin: 0 0 4px;"><strong>Correo de acceso:</strong> ${to}</p>
+          <p style="margin: 0; color: #737373; font-size: 13px;">Por seguridad, configura tu propia contraseña con el botón de abajo antes de tu primer ingreso — nunca la incluimos en un correo.</p>
+        </div>
+        <p>
+          <a
+            href="${setupUrl}"
+            style="display: inline-block; background: #ea580c; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: bold;"
+          >
+            Configurar mi contraseña
+          </a>
+        </p>
+        <p>Este enlace vence en 1 hora. Si expira, puedes pedir uno nuevo desde "¿Olvidaste tu contraseña?" en la pantalla de acceso.</p>
+        <p style="color: #737373; font-size: 12px;">Si el botón no funciona, copia y pega este enlace en tu navegador: ${setupUrl}</p>
+        <p style="color: #a3a3a3; font-size: 11px; margin-top: 24px; text-align: center;">© ${new Date().getFullYear()} Mecatos el Santi. Si tienes dudas, contacta a quien administra tu cuenta.</p>
       </div>
     `,
   });

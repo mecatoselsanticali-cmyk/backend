@@ -1,4 +1,4 @@
-# Backend — Mecatos el Santi
+# Backend — Mecatos el Santi actualizado
 
 Contexto específico del paquete `backend/` (API Express + workers de colas).
 Lee primero el `CLAUDE.md` de la raíz del repo (modelo de auth, cookies,

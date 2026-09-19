@@ -128,7 +128,6 @@ export function buildSiigoInvoicePayload(
   }
 
   const paymentTypeId = resolveSiigoPaymentId(sale.paymentMethod);
-  console.log(paymentTypeId)
   if (!paymentTypeId) {
     return {
       error: `No hay id de Siigo configurado para el método de pago '${sale.paymentMethod}' (falta SIIGO_PAYMENT_ID_${sale.paymentMethod})`,
@@ -193,7 +192,6 @@ class DianService {
     }
 
     if (this.mode === "SIIGO") {
-      console.log("Enviando a SIIGO")
       return this.siigoEmit(sale);
     }
 

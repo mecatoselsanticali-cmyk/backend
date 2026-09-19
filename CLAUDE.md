@@ -55,6 +55,22 @@ worker) — esas requieren revisión manual en `/ventas` del admin, porque un
 rechazo definitivo del PTA suele ser un problema de datos, no de
 infraestructura. No cambies esto sin discutirlo explícitamente.
 
+**Bug real encontrado y corregido — el filtro también exige `category:
+"SPECIAL"`, no solo `dianStatus: "PENDING"`.** Toda venta se crea con
+`dianStatus: "PENDING"` sin importar su `category` (`posController.createSale`
+/`adminController.createSaleAdmin`), pero el encolado real al crearse solo
+ocurre si `category` salió `"SPECIAL"` (ver punto 37) — una venta `REGULAR`
+(o de una sede sin `dianResponsible`) queda `PENDING` para siempre a
+propósito, porque nunca debía transmitirse. Antes de esta corrección, el
+`Sale.find` de este job no filtraba por `category`, así que no podía
+distinguir "se perdió el encolado real de una `SPECIAL`" de "esta venta
+nunca debía encolarse" — ambos casos se ven idénticos como `PENDING` — y
+terminaba reencolando (y timbrando de verdad) ventas `REGULAR` en cada
+corrida, silenciosamente. Si agregas otra categoría/condición nueva que
+decida si una venta se transmite o no, replica el mismo filtro acá — de lo
+contrario este job vuelve a "rescatar" ventas que nunca debieron llegar a
+DIAN.
+
 ### 4. Redis: soporta `REDIS_URL` (managed) y host/puerto sueltos (local)
 
 `backend/src/config/redis.ts` prioriza `REDIS_URL` si está definida (para

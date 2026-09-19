@@ -15,6 +15,16 @@ import { enqueueSaleForDianEmission, hasLiveDianJob } from "../queues/dianQueue"
  * Solo se consideran ventas con más de STALE_MINUTES de antigüedad para no
  * pisar ventas que están en su ciclo normal de procesamiento (que toma
  * segundos, no minutos).
+ *
+ * **`category: "SPECIAL"` es obligatorio en el filtro** — toda venta se crea
+ * con `dianStatus: "PENDING"` sin importar su `category` (ver
+ * `posController.createSale`/`adminController.createSaleAdmin`), pero solo
+ * las `SPECIAL` se encolan de verdad al crearse (punto 37 de CLAUDE.md); una
+ * venta `REGULAR` queda `PENDING` para siempre a propósito, porque nunca
+ * debía transmitirse. Sin este filtro, este job terminaba "rescatando" y
+ * timbrando ventas `REGULAR` cada corrida — bug real encontrado y
+ * corregido: no distinguía "se perdió el encolado" de "nunca debía
+ * encolarse", porque ambos casos se ven idénticos como `PENDING`.
  */
 
 const STALE_MINUTES = Number(process.env.RECONCILE_STALE_MINUTES) || 2;
@@ -31,6 +41,7 @@ export async function reconcilePendingDianSales(): Promise<ReconciliationResult>
 
   const staleSales = await Sale.find({
     dianStatus: "PENDING",
+    category: "SPECIAL",
     createdAt: { $lt: staleThreshold },
   })
     .select("_id createdAt")

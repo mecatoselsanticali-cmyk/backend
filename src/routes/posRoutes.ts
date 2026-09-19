@@ -9,6 +9,7 @@ import {
 import {
   getCatalog,
   createSale,
+  getSaleStatus,
   syncOfflineSales,
   getDailyTotal,
   registerPettyCashExpense,
@@ -52,6 +53,7 @@ router.post("/sales", requirePosSession, asyncHandler(createSale));
 router.post("/sales/sync-batch", requirePosSession, asyncHandler(syncOfflineSales));
 router.get("/sales/daily-total", requirePosSession, asyncHandler(getDailyTotal));
 router.get("/sales/history", requirePosSession, asyncHandler(listCashierSales));
+router.get("/sales/:id/status", requirePosSession, asyncHandler(getSaleStatus));
 
 // Turnos / Arqueo
 router.get("/shifts/current", requirePosSession, asyncHandler(getCurrentShift));

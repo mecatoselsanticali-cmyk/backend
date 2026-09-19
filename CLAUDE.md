@@ -1532,9 +1532,23 @@ de pago) pero sí para Web Services — con la condición de que el proceso
 abra un puerto HTTP y responda, o el deploy falla con "no open ports
 detected". `dianWorker.ts` agregó un `express()` mínimo, sin ninguna otra
 ruta más que `GET /health` (200, `{status, service, uptime}`), escuchando
-en `process.env.PORT || 3000` — arrancado como lo primero que hace
-`main()`, antes de `connectDB()`, para que el puerto quede abierto lo
-antes posible y no dependa de la latencia de Mongo al conectar.
+en `process.env.DIAN_WORKER_PORT || process.env.PORT || 3000` — arrancado
+como lo primero que hace `main()`, antes de `connectDB()`, para que el
+puerto quede abierto lo antes posible y no dependa de la latencia de Mongo
+al conectar.
+
+**Gotcha real ya corregido — en local, arrancaba con `EADDRINUSE :4000`
+si el API ya estaba corriendo.** La primera versión leía `process.env.PORT`
+directo, sin más — pero `dianWorker.ts` carga el mismo `backend/.env` que
+`server.ts` (`import "dotenv/config"` en ambos), y ese `.env` ya trae
+`PORT=4000` para el API. Con `npm run dev` corriendo en una terminal y
+`npm run worker:dian` en otra (el flujo normal de desarrollo — son
+procesos separados a propósito, ver punto 5), el segundo intentaba abrir
+ESE MISMO puerto 4000 y reventaba al arrancar. Se agregó `DIAN_WORKER_PORT`
+(`backend/.env`, `DIAN_WORKER_PORT=4002` en desarrollo) como variable
+específica del worker, con prioridad sobre `PORT` — en Render no hace
+falta definirla: al no existir ahí, cae directo a `PORT`, que Render
+inyecta solo para el servicio del worker.
 
 **Esto NO contradice el punto 5** ("el worker DIAN es un proceso separado
 del API, siempre") — sigue siendo `dianWorker.ts` corriendo solo, nunca se

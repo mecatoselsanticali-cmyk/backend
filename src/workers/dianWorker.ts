@@ -11,16 +11,25 @@ import { reconcilePendingDianSales } from "../jobs/reconcilePendingDianSales";
 
 // Servidor HTTP mínimo, solo para que Render acepte este proceso como Web
 // Service en el plan gratis (que exige un puerto abierto; un Background
-// Worker real requiere plan pago) — ver punto 66 de backend/CLAUDE.md para
+// Worker real requiere plan pago) — ver punto 67 de backend/CLAUDE.md para
 // el detalle completo y los riesgos aceptados de este approach. No agrega
 // `cors`: este endpoint solo lo golpea un monitor externo (UptimeRobot), no
 // un navegador, mismo criterio que `GET /health` del API (punto 58).
+//
+// `DIAN_WORKER_PORT` tiene prioridad sobre `PORT` a propósito — en local,
+// `dianWorker.ts` y `server.ts` cargan el mismo `backend/.env`
+// (`import "dotenv/config"`), que ya trae `PORT=4000` para el API; si este
+// servidor leyera `PORT` directo, correr `npm run dev` y `npm run
+// worker:dian` a la vez revienta con `EADDRINUSE :4000` apenas arranca el
+// segundo. En Render, el servicio del worker no necesita que definas
+// `DIAN_WORKER_PORT` en el dashboard — con esa variable ausente cae solo a
+// `PORT`, que Render inyecta automáticamente por su cuenta.
 function startHealthServer() {
   const app = express();
   app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok", service: "mecatos-dian-worker", uptime: process.uptime() });
   });
-  const port = Number(process.env.PORT) || 3000;
+  const port = Number(process.env.DIAN_WORKER_PORT) || Number(process.env.PORT) || 3000;
   app.listen(port, () => {
     console.log(`[DianWorker] Health check escuchando en :${port}`);
   });

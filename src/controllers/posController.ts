@@ -296,6 +296,40 @@ export async function createSale(req: Request, res: Response) {
 }
 
 /**
+ * GET /api/pos/sales/:id/status
+ *
+ * Probe liviano para que PaymentPanel.tsx sepa cuándo una venta `category:
+ * "SPECIAL"` terminó de emitirse ante la DIAN, sin bloquear la respuesta de
+ * `createSale` (esa sigue respondiendo de inmediato — ver punto 2 de
+ * backend/CLAUDE.md). El frontend hace polling corto sobre este endpoint
+ * mientras `dianStatus` siga en "PENDING"; para cualquier otra venta
+ * (`category: "REGULAR"`) el recibo se muestra sin llamar a esto en
+ * absoluto.
+ *
+ * Acotado a la sede de la sesión — un cajero no debería poder consultar el
+ * estado DIAN de una venta de otra sede solo adivinando su id.
+ */
+export async function getSaleStatus(req: Request, res: Response) {
+  const posSession = req.posSession!;
+
+  const sale = await Sale.findOne(
+    { _id: req.params.id, branchId: posSession.branchId },
+    "dianStatus cufe qrCodeUrl dianInvoiceNumber"
+  ).lean();
+
+  if (!sale) {
+    return res.status(404).json({ error: "Venta no encontrada" });
+  }
+
+  return res.json({
+    dianStatus: sale.dianStatus,
+    cufe: sale.cufe,
+    qrCodeUrl: sale.qrCodeUrl,
+    dianInvoiceNumber: sale.dianInvoiceNumber,
+  });
+}
+
+/**
  * POST /api/pos/sales/sync-batch
  * Recibe un lote de ventas encoladas en IndexedDB mientras el POS estuvo offline.
  */

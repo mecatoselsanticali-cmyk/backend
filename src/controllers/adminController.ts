@@ -2,7 +2,15 @@ import { Request, Response } from "express";
 import { Branch } from "../models/Branch";
 import { Product } from "../models/Product";
 import { ProductStock } from "../models/ProductStock";
-import { Sale, resolvePaymentStatus } from "../models/Sale";
+import {
+  Sale,
+  resolvePaymentStatus,
+  resolvePaymentMethodForChannel,
+  isDeliveryAppChannel,
+  PAYMENT_METHOD_GROUP,
+  PaymentMethod,
+  OrderType,
+} from "../models/Sale";
 import { User } from "../models/User";
 import { AccountPayable, AccountReceivable } from "../models/Accounts";
 import { Expense, IExpense } from "../models/Expense";
@@ -82,8 +90,39 @@ export async function listBranches(req: Request, res: Response) {
   });
 }
 
+// Deuda técnica temporal, a propósito — TODAS las sedes dianResponsible
+// comparten hoy el mismo vendedor/documento de Siigo (los de la sede
+// "Boulevard", confirmados reales con `npm run test:siigo`), en vez de
+// tener cada una el suyo propio (que es como en realidad está armada la
+// cuenta de Siigo — un vendedor + una resolución por punto de venta, ver
+// punto 10 de backend/CLAUDE.md). Se adoptó este atajo para que una sede
+// nueva marcada `dianResponsible` no quede bloqueada sin poder emitir
+// ninguna venta hasta que un admin entre a mano a `DianConfig.tsx` — pero
+// significa que, hasta que se resuelva de verdad (dar de alta un
+// vendedor/resolución real en Siigo por cada sede nueva), todas las
+// facturas de todas las sedes dianResponsible quedan atribuidas al mismo
+// vendedor/resolución de "Boulevard" ante la DIAN. Revisar esto antes de
+// que el negocio abra una segunda sede dianResponsible de verdad.
+const DEFAULT_SIIGO_SELLER_ID = 1032;
+const DEFAULT_SIIGO_DOCUMENT_ID = 32502;
+
 export async function createBranch(req: Request, res: Response) {
-  const branch = await Branch.create(req.body);
+  const payload: any = { ...req.body };
+
+  // `dianResponsible` no viene explícito en el body -> el default del
+  // schema (`true`, ver Branch.ts) es el que manda, igual que acá.
+  if (payload.dianResponsible !== false) {
+    payload.dianConfig = {
+      siigoSellerId: DEFAULT_SIIGO_SELLER_ID,
+      siigoDocumentId: DEFAULT_SIIGO_DOCUMENT_ID,
+      // Si el body ya trajo su propio dianConfig (hoy no pasa desde
+      // BranchModal.tsx, pero por si algún otro caller sí lo manda), sus
+      // valores explícitos ganan sobre el default de acá.
+      ...payload.dianConfig,
+    };
+  }
+
+  const branch = await Branch.create(payload);
   return res.status(201).json(branch);
 }
 
@@ -346,6 +385,100 @@ export async function setProductStock(req: Request, res: Response) {
   });
 
   return res.json(await buildProductStockSummary(product._id as Types.ObjectId));
+}
+
+/**
+ * GET /api/admin/products/stock/matrix -> catálogo activo completo x
+ * sedes activas, para el modal de "Carga Masiva" (`BulkStockModal.tsx`).
+ * `setProductStock`/`getProductStock` de arriba son por-producto (un
+ * `ProductStock.find({productId})` por request) — repetir eso una vez por
+ * producto acá habría sido un N+1 real para ~44+ productos, así que esto
+ * hace UNA sola consulta de `ProductStock` para todo el set en vez de
+ * reusar `buildProductStockSummary` en loop.
+ *
+ * NO colisiona con `GET /products/:id/stock` pese a la forma parecida
+ * (verificado) — ese patrón exige que el ÚLTIMO segmento sea literalmente
+ * "stock", y acá "stock" va en el segmento del medio de la URL, así que
+ * Express nunca las confunde sin importar el orden de registro en
+ * adminRoutes.ts.
+ */
+export async function getStockMatrix(req: Request, res: Response) {
+  const [products, branches] = await Promise.all([
+    Product.find({ active: true }, { name: 1, sku: 1 }).sort({ name: 1 }).lean(),
+    Branch.find({ status: true }, { name: 1 }).sort({ name: 1 }).lean(),
+  ]);
+
+  const productIds = products.map((p) => p._id);
+  const stocks = await ProductStock.find({ productId: { $in: productIds } }).lean();
+
+  const stock: Record<string, Record<string, number>> = {};
+  for (const s of stocks) {
+    const pid = String(s.productId);
+    if (!stock[pid]) stock[pid] = {};
+    stock[pid][String(s.branchId)] = s.quantity;
+  }
+
+  return res.json({
+    products: products.map((p) => ({ _id: p._id, name: p.name, sku: p.sku })),
+    branches: branches.map((b) => ({ _id: b._id, name: b.name })),
+    stock,
+  });
+}
+
+/**
+ * PUT /api/admin/products/stock/bulk -> misma semántica $set exacta que
+ * `setProductStock`, pero para MUCHOS productos en una sola request (el
+ * modal de "Carga Masiva" solo manda las celdas que el admin realmente
+ * editó, no la grilla completa — así una sesión concurrente que haya
+ * tocado otra celda de otro producto/sede no queda pisada sin querer).
+ * Solo ADMIN (`requireRole("ADMIN")` en adminRoutes.ts), mismo criterio
+ * que `setProductStock` — ver el comentario de ese endpoint arriba para
+ * el porqué.
+ */
+export async function bulkSetProductStock(req: Request, res: Response) {
+  const updates: { productId?: string; branchId?: string; quantity?: number }[] = req.body.updates || [];
+  const valid = updates
+    .filter((u) => u.productId && u.branchId && Number.isFinite(Number(u.quantity)) && Number(u.quantity) >= 0)
+    .map((u) => ({
+      productId: u.productId as string,
+      branchId: u.branchId as string,
+      quantity: Math.floor(Number(u.quantity)),
+    }));
+
+  if (valid.length === 0) {
+    return res.status(400).json({ error: "No hay cambios válidos para guardar" });
+  }
+
+  const productIds = [...new Set(valid.map((u) => u.productId))];
+  const branchIds = [...new Set(valid.map((u) => u.branchId))];
+  const [validProductCount, validBranchCount] = await Promise.all([
+    Product.countDocuments({ _id: { $in: productIds } }),
+    Branch.countDocuments({ _id: { $in: branchIds }, status: true }),
+  ]);
+  if (validProductCount !== productIds.length) {
+    return res.status(400).json({ error: "Uno o más productos no son válidos" });
+  }
+  if (validBranchCount !== branchIds.length) {
+    return res.status(400).json({ error: "Una o más sedes no son válidas" });
+  }
+
+  await Promise.all(
+    valid.map((u) =>
+      ProductStock.findOneAndUpdate(
+        { productId: u.productId, branchId: u.branchId },
+        { $set: { quantity: u.quantity } },
+        { upsert: true }
+      )
+    )
+  );
+
+  for (const productId of productIds) {
+    syncInventoryToSheets(new Types.ObjectId(productId)).catch((err) => {
+      console.error(`[bulkSetProductStock] No se pudo sincronizar inventario de ${productId} a Sheets:`, err);
+    });
+  }
+
+  return res.json({ updated: valid.length });
 }
 
 const DIACRITICS_RE = new RegExp("[\\u0300-\\u036f]", "g");
@@ -655,10 +788,15 @@ export async function getDashboardKpis(req: Request, res: Response) {
 // fechas elegido, su monto sigue sumado en `netTotal`/`grossTotal`
 // (ninguno de los dos filtra por método), solo deja de tener su propia
 // fila en este desglose puntual.
-const PAYMENT_METHOD_LABELS: Record<string, string> = {
-  CASH: "Efectivo",
-  NEQUI: "Nequi / Daviplata",
-  DELIVERY_APP: "Delivery Apps (Rappi/DiDi)",
+//
+// Llaves por GRUPO (`PaymentMethodGroup`, ver Sale.ts), no por valor crudo
+// de `paymentMethod` — así una venta vieja `CASH`/`DELIVERY_APP` y una
+// nueva `EFECTIVO`/`BANCOLOMBIA` caen en la misma fila del desglose, en vez
+// de aparecer como dos filas separadas (ver punto 34 de CLAUDE.md).
+export const PAYMENT_METHOD_GROUP_LABELS: Record<string, string> = {
+  CASH_GROUP: "Efectivo",
+  NEQUI_GROUP: "Nequi / Daviplata",
+  BANCOLOMBIA_GROUP: "Bancolombia / Delivery Apps (Rappi/DiDi)",
 };
 
 /**
@@ -776,14 +914,17 @@ export async function getDashboardMetrics(req: Request, res: Response) {
     ]),
     Purchase.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, sum: { $sum: "$amount" } } }]),
     // "Cuentas por cobrar (DiDi)" en `paymentMethods` más abajo — dinero
-    // de ventas por app de domicilios del rango/sede elegidos que
-    // TODAVÍA no se confirma como liquidado (ver punto 34 de
-    // backend/CLAUDE.md: DELIVERY_APP nace "PENDING_PAYMENT", un admin lo
-    // confirma a mano cuando ve el depósito real en el banco). Mismo
-    // `saleMatch` que el resto del dashboard (rango de fechas + sede +
-    // `status: "ACTIVE"`), con el filtro extra de método/estado de pago.
+    // de ventas Rappi/DiDi del rango/sede elegidos que TODAVÍA no se
+    // confirma como liquidado (ver punto 34 de backend/CLAUDE.md,
+    // reescrito: el canal RAPPI/DIDI nace "PENDING_PAYMENT", un admin lo
+    // confirma a mano cuando ve el depósito real en el banco). Filtra solo
+    // por `paymentStatus` — ya NO por un valor de `paymentMethod`
+    // específico (antes exigía `DELIVERY_APP`): el estado pendiente ya es
+    // 100% señal del canal (`resolvePaymentStatus`), así que este filtro
+    // solo captura tanto ventas viejas (`DELIVERY_APP`) como nuevas
+    // (`BANCOLOMBIA`) sin tener que enumerarlas.
     Sale.aggregate([
-      { $match: { ...saleMatch, paymentMethod: "DELIVERY_APP", paymentStatus: "PENDING_PAYMENT" } },
+      { $match: { ...saleMatch, paymentStatus: "PENDING_PAYMENT" } },
       { $group: { _id: null, amount: { $sum: "$total" } } },
     ]),
     // Widget "Stock Crítico" (ver punto 62 de admin-frontend/CLAUDE.md) —
@@ -870,12 +1011,21 @@ export async function getDashboardMetrics(req: Request, res: Response) {
   // salió" que el negocio pidió para este widget.
   const profitability = summary.netTotal - totalPurchases - totalExpenses;
 
-  const amountByMethod = new Map(paymentMethodsAgg.map((m: any) => [m._id, m.amount]));
+  // Suma por GRUPO (ver PAYMENT_METHOD_GROUP en Sale.ts) para que un
+  // `paymentMethod` viejo (CASH/DELIVERY_APP) y su equivalente nuevo
+  // (EFECTIVO/BANCOLOMBIA) terminen en la misma fila del desglose, no en
+  // dos separadas — ver punto 34 de CLAUDE.md.
+  const amountByGroup = new Map<string, number>();
+  for (const m of paymentMethodsAgg as any[]) {
+    const group = PAYMENT_METHOD_GROUP[m._id as PaymentMethod];
+    if (!group) continue; // valor desconocido/corrupto, no debería pasar — se ignora en vez de reventar el dashboard
+    amountByGroup.set(group, (amountByGroup.get(group) || 0) + m.amount);
+  }
   const pendingDidiAmount = pendingDidiAgg[0]?.amount || 0;
   const paymentMethods = [
-    ...Object.entries(PAYMENT_METHOD_LABELS).map(([key, label]) => ({
+    ...Object.entries(PAYMENT_METHOD_GROUP_LABELS).map(([group, label]) => ({
       method: label,
-      amount: amountByMethod.get(key) || 0,
+      amount: amountByGroup.get(group) || 0,
     })),
     { method: "Cuentas por cobrar (DiDi)", amount: pendingDidiAmount },
     { method: "Devoluciones / Notas Crédito", amount: 0 },
@@ -916,11 +1066,23 @@ export async function listSales(req: Request, res: Response) {
   if (dianStatus) filter.dianStatus = dianStatus;
   if (orderType) filter.orderType = orderType;
   if (category) filter.category = category;
-  if (paymentMethod) filter.paymentMethod = paymentMethod;
-  // Filtro nuevo para la vista de "pendientes DiDi/Rappi" del miércoles de
-  // liquidación (ver punto 53 de admin-frontend/CLAUDE.md) — combinado con
-  // paymentMethod=DELIVERY_APP en el frontend, aunque este filtro por sí
-  // solo también sirve para cualquier otro uso futuro de paymentStatus.
+  // Filtra por GRUPO (ver PAYMENT_METHOD_GROUP en Sale.ts), no por el
+  // valor crudo pedido — así elegir "Efectivo" (que el frontend manda como
+  // el valor nuevo `EFECTIVO`) también trae ventas viejas guardadas como
+  // `CASH`, sin necesitar una migración de datos. Ver punto 34 de CLAUDE.md.
+  if (paymentMethod) {
+    const group = PAYMENT_METHOD_GROUP[paymentMethod as PaymentMethod];
+    const groupValues = group
+      ? (Object.keys(PAYMENT_METHOD_GROUP) as PaymentMethod[]).filter((k) => PAYMENT_METHOD_GROUP[k] === group)
+      : [paymentMethod as string];
+    filter.paymentMethod = groupValues.length > 1 ? { $in: groupValues } : groupValues[0];
+  }
+  // Filtro para la vista de "pendientes DiDi/Rappi" del miércoles de
+  // liquidación (ver punto 53 de admin-frontend/CLAUDE.md) — ya NO se
+  // combina con paymentMethod=DELIVERY_APP en el frontend (ver
+  // PendingDidiPaymentsModal.tsx): `paymentStatus` por sí solo ya es señal
+  // suficiente del canal Rappi/DiDi (ver `resolvePaymentStatus`), así que
+  // usarlo solo también captura BANCOLOMBIA sin enumerar valores.
   if (paymentStatus) filter.paymentStatus = paymentStatus;
   if (cashierId) filter.cashierId = new Types.ObjectId(String(cashierId));
   // `startOfLocalDay`/`endOfLocalDay` (ver punto 33/24 de CLAUDE.md) — antes
@@ -1017,11 +1179,18 @@ export async function listSaleUsers(req: Request, res: Response) {
 export async function createSaleAdmin(req: Request, res: Response) {
   const { items, paymentMethod, customer } = req.body;
   let { branchId } = req.body;
-  const THIRTY_MINUTES = 2 * 60 * 1000;
-  const MAX_GROUP_1 = 509000;
+  const THIRTY_MINUTES = Number(process.env.THIRTY_MINUTES);
+  const MAX_GROUP_1 = Number(process.env.MAX_GROUP_1);
   let category: string = "REGULAR";
   let hasSpace: boolean = false;
   let thirtyMinutesPassed: boolean = false;
+
+  // "Procesado por DiDi" desde el modal "Agregar venta" — a diferencia del
+  // flujo del cajero (siempre POS_COUNTER hasta ahora), acá el admin SÍ
+  // puede marcar el canal al crear la venta. Rappi no es seleccionable
+  // desde este formulario rápido (solo se asigna después vía
+  // SaleEditModal, igual que antes) — ver punto 34 de CLAUDE.md.
+  const orderType: OrderType = req.body.orderType === "DIDI" ? "DIDI" : "POS_COUNTER";
 
   // Un GERENTE solo puede registrar ventas de su propia sede, sin importar
   // qué branchId mande el body (mismo principio que resolveBranchFilter,
@@ -1034,7 +1203,10 @@ export async function createSaleAdmin(req: Request, res: Response) {
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "La venta debe tener al menos un producto" });
   }
-  if (!paymentMethod) {
+  // Si el canal ya fuerza Bancolombia (ver resolvePaymentMethodForChannel
+  // más abajo), no tiene sentido exigir que el admin elija un método de
+  // pago que de todos modos se va a ignorar.
+  if (!paymentMethod && !isDeliveryAppChannel(orderType)) {
     return res.status(400).json({ error: "Selecciona el método de pago" });
   }
 
@@ -1158,10 +1330,10 @@ export async function createSaleAdmin(req: Request, res: Response) {
   const sale = await Sale.create({
     branchId,
     cashierId: req.admin!.userId,
-    orderType: "POS_COUNTER",
+    orderType,
     items: saleItems,
-    paymentMethod,
-    paymentStatus: resolvePaymentStatus(paymentMethod),
+    paymentMethod: resolvePaymentMethodForChannel(orderType, paymentMethod),
+    paymentStatus: resolvePaymentStatus(orderType),
     subtotal,
     tax,
     total,
@@ -1196,6 +1368,7 @@ export async function createSaleAdmin(req: Request, res: Response) {
   // quede `dianStatus: PENDING` sin job vivo, así que perder este enqueue
   // puntual no deja una venta huérfana.
   if(branchInfo.dianResponsible === true && hasSpace && thirtyMinutesPassed){
+    console.log("enviando venta como especial")
     enqueueSaleForDianEmission(String(sale._id)).catch((err) => {
       console.error(`[createSaleAdmin] No se pudo encolar la venta ${sale._id} para DIAN:`, err);
     });
@@ -1243,18 +1416,27 @@ export async function updateSaleAdmin(req: Request, res: Response) {
     return res.status(400).json({ error: "No se puede editar una venta cancelada" });
   }
 
-  // Si el método de pago cambia de verdad (no solo se reenvía el mismo
-  // valor que ya tenía), recalcula `paymentStatus` para que no quede
-  // desincronizado — ver `resolvePaymentStatus` y punto 34 de CLAUDE.md. Si
-  // vuelve a un método que no es DELIVERY_APP, limpia `settlementDate`: la
-  // liquidación anterior (si la hubo) ya no aplica a este método nuevo.
-  if (paymentMethod && paymentMethod !== sale.paymentMethod) {
-    sale.paymentMethod = paymentMethod;
-    sale.paymentStatus = resolvePaymentStatus(paymentMethod);
-    if (sale.paymentStatus === "PENDING_PAYMENT") sale.settlementDate = undefined;
+  // El canal (orderType) manda ahora, no solo el método de pago — un
+  // cambio de canal a/desde RAPPI/DIDI por sí solo (sin tocar
+  // paymentMethod en el body) también debe disparar el forzado a
+  // Bancolombia/pendiente, así que se resuelve el orderType EFECTIVO
+  // primero (lo que venga en el body, o el que ya tenía la venta) y se
+  // deriva método/estado a partir de ese — ver `resolvePaymentMethodForChannel`/
+  // `resolvePaymentStatus` y punto 34 de CLAUDE.md (reescrito). Si el
+  // resultado final aterriza en PENDING_PAYMENT, limpia `settlementDate`:
+  // cualquier liquidación anterior ya no aplica a este ciclo nuevo.
+  const effectiveOrderType: OrderType = orderType || sale.orderType;
+  const requestedPaymentMethod: PaymentMethod = paymentMethod || sale.paymentMethod;
+  const finalPaymentMethod = resolvePaymentMethodForChannel(effectiveOrderType, requestedPaymentMethod);
+  const finalPaymentStatus = resolvePaymentStatus(effectiveOrderType);
+
+  if (finalPaymentMethod !== sale.paymentMethod || finalPaymentStatus !== sale.paymentStatus) {
+    sale.paymentMethod = finalPaymentMethod;
+    sale.paymentStatus = finalPaymentStatus;
+    if (finalPaymentStatus === "PENDING_PAYMENT") sale.settlementDate = undefined;
   }
+  sale.orderType = effectiveOrderType;
   if (customer !== undefined) sale.customer = customer;
-  if (orderType) sale.orderType = orderType;
   if (category === "REGULAR" || category === "SPECIAL") sale.category = category;
   await sale.save();
 

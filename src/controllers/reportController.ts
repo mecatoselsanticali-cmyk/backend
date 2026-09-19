@@ -3,12 +3,12 @@ import path from "path";
 import fs from "fs";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
-import { Sale } from "../models/Sale";
+import { Sale, PAYMENT_METHOD_GROUP, PaymentMethod } from "../models/Sale";
 import { Purchase } from "../models/Purchase";
 import { Expense } from "../models/Expense";
 import { ProductStock } from "../models/ProductStock";
 import { Branch } from "../models/Branch";
-import { resolveBranchFilter } from "./adminController";
+import { resolveBranchFilter, PAYMENT_METHOD_GROUP_LABELS } from "./adminController";
 import { startOfLocalDay, endOfLocalDay, COLOMBIA_TIME_ZONE } from "../utils/dateRange";
 
 /**
@@ -155,9 +155,16 @@ async function fetchReportData(req: Request): Promise<ReportData> {
   const totalExpenses = expenses.reduce((sum, e: any) => sum + e.amount, 0);
   const totalInventoryValue = inventory.reduce((sum, i) => sum + i.totalValue, 0);
 
+  // Agrupado por PAYMENT_METHOD_GROUP (ver Sale.ts) en vez de por el valor
+  // crudo de `paymentMethod` — así una venta vieja (`CASH`/`DELIVERY_APP`)
+  // y su equivalente nuevo (`EFECTIVO`/`BANCOLOMBIA`) se suman en la misma
+  // fila del resumen (Excel/PDF), en vez de aparecer como dos filas
+  // separadas. Ver punto 34 de CLAUDE.md.
   const salesByMethod: Record<string, number> = {};
   for (const s of sales as any[]) {
-    salesByMethod[s.paymentMethod] = (salesByMethod[s.paymentMethod] || 0) + s.total;
+    const group = PAYMENT_METHOD_GROUP[s.paymentMethod as PaymentMethod];
+    const label = (group && PAYMENT_METHOD_GROUP_LABELS[group]) || s.paymentMethod;
+    salesByMethod[label] = (salesByMethod[label] || 0) + s.total;
   }
 
   const expensesByCategory: Record<string, number> = {};

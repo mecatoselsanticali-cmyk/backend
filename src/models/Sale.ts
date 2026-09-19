@@ -1,11 +1,28 @@
 import { Schema, model, Document, Types } from "mongoose";
 
 export type OrderType = "POS_COUNTER" | "RAPPI" | "DIDI" | "DELIVERY_LOCAL";
-export type PaymentMethod = "CASH" | "NEQUI" | "CARD" | "DELIVERY_APP";
-// CASH/NEQUI/CARD se dan por cobrados el mismo día; DELIVERY_APP (Rappi/
-// DiDi) lo cobra el agregador y liquida el dinero a la cuenta bancaria días
-// después — hasta entonces es Cuentas por Cobrar, no caja. Ver punto 34 de
+// CASH/CARD/DELIVERY_APP son valores históricos, reemplazados por
+// EFECTIVO/BANCOLOMBIA (NEQUI no cambió) — se mantienen en el tipo/enum
+// solo para que ventas viejas sigan leyéndose bien, nunca se ofrecen en
+// ningún formulario nuevo (mismo tratamiento que ya tenía CARD, ver punto
+// 61 de admin-frontend/CLAUDE.md). Ver PAYMENT_METHOD_GROUP más abajo y el
+// punto 34 de CLAUDE.md (reescrito) para el detalle completo.
+export type PaymentMethod = "CASH" | "NEQUI" | "CARD" | "DELIVERY_APP" | "EFECTIVO" | "BANCOLOMBIA";
+
+// Agrupa valores viejos y nuevos que representan el mismo destino real del
+// dinero — único punto de verdad para todo lo que suma/filtra por método de
+// pago (arqueo de caja, dashboard, reportes, filtro de listSales), así no
+// hay que repetir la lista vieja+nueva en cada lugar. Ver punto 34 de
 // CLAUDE.md.
+export type PaymentMethodGroup = "CASH_GROUP" | "NEQUI_GROUP" | "CARD_GROUP" | "BANCOLOMBIA_GROUP";
+export const PAYMENT_METHOD_GROUP: Record<PaymentMethod, PaymentMethodGroup> = {
+  CASH: "CASH_GROUP",
+  EFECTIVO: "CASH_GROUP",
+  NEQUI: "NEQUI_GROUP",
+  CARD: "CARD_GROUP",
+  DELIVERY_APP: "BANCOLOMBIA_GROUP",
+  BANCOLOMBIA: "BANCOLOMBIA_GROUP",
+};
 export type PaymentStatus = "COMPLETED" | "PENDING_PAYMENT";
 export type DianStatus = "PENDING" | "SENT" | "APPROVED" | "REJECTED";
 export type InvoiceType = "POS_DOC" | "FACTURA_NOMINAL";
@@ -60,6 +77,11 @@ export interface ISale extends Document {
   dianStatus: DianStatus;
   cufe?: string;
   qrCodeUrl?: string;
+  // Número real de la factura electrónica asignado por el PTA (ej.
+  // "FV-3-7" en Siigo, campo `name` de su respuesta) — se usa en el
+  // recibo ("Factura electrónica de venta No. ...") cuando la venta ya
+  // está timbrada. Ver dianService.ts/dianWorker.ts.
+  dianInvoiceNumber?: string;
   offlineCreated: boolean;
   localTicketId?: string; // id generado en el cliente offline (Dexie) para deduplicar en sync
   status: SaleStatus;
@@ -95,7 +117,7 @@ const SaleSchema = new Schema<ISale>(
     items: { type: [SaleItemSchema], required: true },
     paymentMethod: {
       type: String,
-      enum: ["CASH", "NEQUI", "CARD", "DELIVERY_APP"],
+      enum: ["CASH", "NEQUI", "CARD", "DELIVERY_APP", "EFECTIVO", "BANCOLOMBIA"],
       required: true,
     },
     // Default "COMPLETED" en el schema por si algo crea un Sale sin pasar
@@ -132,6 +154,7 @@ const SaleSchema = new Schema<ISale>(
     },
     cufe: String,
     qrCodeUrl: String,
+    dianInvoiceNumber: String,
     offlineCreated: { type: Boolean, default: false },
     localTicketId: { type: String, index: true, sparse: true, unique: true },
     status: { type: String, enum: ["ACTIVE", "CANCELLED"], default: "ACTIVE", index: true },
@@ -146,12 +169,42 @@ SaleSchema.index({ branchId: 1, createdAt: -1 });
 export const Sale = model<ISale>("Sale", SaleSchema);
 
 /**
- * Único punto de verdad para el `paymentStatus` inicial de una venta nueva
- * — usado por los 3 sitios que llaman `Sale.create` (posController.createSale,
- * posController.syncOfflineSales, adminController.createSaleAdmin) y por
- * `updateSaleAdmin` al recalcular tras un cambio de `paymentMethod`. Ver
- * punto 34 de CLAUDE.md.
+ * true si el canal de la venta es un agregador de domicilios (Rappi o
+ * DiDi) — el único disparador de la Cuenta por Cobrar Bancolombia desde
+ * este refactor (ver punto 34 de CLAUDE.md, reescrito). A propósito ya NO
+ * depende de `paymentMethod`: antes se evitaba a propósito gatear por
+ * `orderType` porque un domicilio DiDi pagado en efectivo contra entrega
+ * no debía quedar pendiente — se decidió explícitamente revertir eso, así
+ * que ahora CUALQUIER venta con canal Rappi/DiDi quiere Bancolombia +
+ * pendiente, sin importar cómo se cobró en la calle.
  */
-export function resolvePaymentStatus(paymentMethod: PaymentMethod): PaymentStatus {
-  return paymentMethod === "DELIVERY_APP" ? "PENDING_PAYMENT" : "COMPLETED";
+export function isDeliveryAppChannel(orderType: OrderType): boolean {
+  return orderType === "RAPPI" || orderType === "DIDI";
+}
+
+/**
+ * Fuerza `paymentMethod: "BANCOLOMBIA"` cuando el canal es Rappi/DiDi,
+ * ignorando lo que se haya pedido — para cualquier otro canal respeta el
+ * método pedido tal cual. Server-side siempre, no confíes en que el
+ * cliente ya lo mandó forzado (mismo criterio que el resto del proyecto:
+ * el backend es quien valida reglas de negocio, no el frontend).
+ */
+export function resolvePaymentMethodForChannel(
+  orderType: OrderType,
+  requestedPaymentMethod: PaymentMethod
+): PaymentMethod {
+  return isDeliveryAppChannel(orderType) ? "BANCOLOMBIA" : requestedPaymentMethod;
+}
+
+/**
+ * Único punto de verdad para el `paymentStatus` de una venta — usado por
+ * los 3 sitios que llaman `Sale.create` (posController.createSale,
+ * posController.syncOfflineSales, adminController.createSaleAdmin) y por
+ * `updateSaleAdmin` al recalcular tras un cambio de canal/método. Ver
+ * punto 34 de CLAUDE.md. Firma cambiada: antes tomaba `paymentMethod`
+ * (comparaba contra `"DELIVERY_APP"`), ahora toma `orderType` — ver
+ * `isDeliveryAppChannel` arriba para el porqué del cambio.
+ */
+export function resolvePaymentStatus(orderType: OrderType): PaymentStatus {
+  return isDeliveryAppChannel(orderType) ? "PENDING_PAYMENT" : "COMPLETED";
 }

@@ -39,6 +39,8 @@ import {
   getProductStock,
   addProductStock,
   setProductStock,
+  getStockMatrix,
+  bulkSetProductStock,
   listUsers,
   createUser,
   getDashboardKpis,
@@ -87,6 +89,16 @@ router.put("/branches/:id", requireRole("ADMIN"), asyncHandler(updateBranch));
 // Inventario -> Productos
 router.get("/products", asyncHandler(listProducts));
 router.post("/products", requireRole("ADMIN", "MANAGER"), asyncHandler(createProduct));
+// Rutas de stock masivo (matriz producto x sede, ver getStockMatrix en
+// adminController.ts) — NO colisionan con "/products/:id/stock" pese a la
+// forma parecida: ese patrón exige que el ÚLTIMO segmento sea literalmente
+// "stock" ("/products/:id/stock"), y acá "stock" va en el segmento del
+// medio ("/products/stock/matrix"/"/products/stock/bulk"), así que Express
+// nunca las confunde sin importar el orden de registro (verificado). Van
+// acá arriba solo por cercanía/legibilidad con el resto de rutas de
+// productos, no porque el orden sea obligatorio.
+router.get("/products/stock/matrix", requireRole("ADMIN"), asyncHandler(getStockMatrix));
+router.put("/products/stock/bulk", requireRole("ADMIN"), asyncHandler(bulkSetProductStock));
 router.put("/products/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(updateProduct));
 router.delete("/products/:id", requireRole("ADMIN", "MANAGER"), asyncHandler(deleteProduct));
 router.get("/products/:id/stock", asyncHandler(getProductStock));

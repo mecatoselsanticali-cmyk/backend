@@ -93,12 +93,241 @@ acepta `string` genérico). Si agregas una nueva firma de JWT, sigue el patrón
 ya usado en `authController.ts`: tipar explícitamente como `SignOptions` y
 castear `expiresIn as SignOptions["expiresIn"]`.
 
-### 10. `dianService.ts` es el único punto de integración con el PTA
+### 10. `dianService.ts` es el único punto de integración con el PTA — ahora con Siigo real (`DIAN_PROVIDER=SIIGO`), además de `MOCK`
 
-Cuando se conecten credenciales reales de Factus (o el proveedor que sea),
-**todo el cambio va dentro de `DianService.emit()`** — el TODO ya está
-marcado ahí. No toques el worker, la cola, ni los controladores: la interfaz
-`DianEmissionResult` ya está diseñada para eso.
+Todo el cambio para conectar un PTA real vive dentro de `dianService.ts`
+(la clase `DianService` + un puñado de funciones exportadas junto a ella) —
+el worker, la cola y los controladores no se tocaron ni deberían tocarse
+para esto, siguen sin saber qué proveedor hay detrás.
+
+**Estado real**: el PTA elegido es **Siigo** (confirmado contra
+`siigo_test/`, un proyecto de exploración aparte con la cuenta real de
+producción de Siigo — `Partner-Id: MecatosElSanti`). **`DIAN_PROVIDER=SIIGO`
+ya está activo en `.env` de este ambiente de desarrollo** — no es un modo de
+prueba del lado de Siigo, cada venta que el worker procese con esa
+configuración queda timbrada de verdad ante la DIAN. El fallback de
+`private mode = process.env.DIAN_PROVIDER || "SIIGO"` en la clase
+`DianService` **también quedó en `"SIIGO"` (no `"MOCK"`)** — si algún
+ambiente nuevo arranca sin `DIAN_PROVIDER` definida en absoluto, cae en
+SIIGO real por default, no en el simulador. Si vas a levantar un ambiente
+de desarrollo nuevo (o le pasas este repo a alguien más), ponle
+`DIAN_PROVIDER=MOCK` explícito en su `.env` — no asumas que el default es
+seguro.
+
+**Gotcha real ya vivido — probar cambios acá exige reiniciar el worker a
+mano, y es fácil terminar con dos corriendo a la vez**: `dianService.ts`
+solo lo ejecuta `dianWorker.ts` (punto 5), y ese proceso corre como
+`ts-node src/workers/dianWorker.ts` **sin nodemon** — a diferencia de
+`npm run dev` (la API, bajo `nodemon --watch src`), el worker no se
+reinicia solo ante un cambio de código NI ante un cambio de `.env`
+(`dotenv/config` solo lee el archivo una vez, al arrancar el proceso).
+`this.mode` además se fija una sola vez en el constructor de
+`DianService`, no se re-evalúa en cada `emit()`. Pasó de verdad: se editó
+`dianService.ts` y `.env` varias veces con el worker viejo todavía corriendo
+en segundo plano, y "no pasaba nada" — el proceso viejo seguía ejecutando
+el código/env de cuando arrancó. **Cada cambio a `dianService.ts` o a
+`DIAN_PROVIDER`/cualquier `SIIGO_*` en `.env` exige matar y volver a correr
+`npm run worker:dian`.** Ojo además con terminar con **dos workers vivos a
+la vez** (uno viejo sin matar + uno nuevo) — ambos consumen de la misma
+cola BullMQ, así que da resultados confusos/duplicados mientras el viejo
+sigue vivo; verificar con `ps aux | grep dianWorker` antes de asumir que
+solo hay uno.
+
+**`npm run test:siigo`** (`backend/src/utils/testSiigoIntegration.ts`) — el
+único comando seguro para probar la integración sin arriesgar una factura
+real: autentica contra Siigo (`getSiigoAccessToken`, un login sin efecto
+secundario), consulta los catálogos reales de la cuenta (tipos de
+documento, formas de pago, usuarios/vendedores — GETs de solo lectura) y
+arma un payload de ejemplo con `buildSiigoInvoicePayload` **sin llamar
+nunca a `POST /v1/invoices`**. Si necesitas descubrir ids nuevos (ej. tras
+crear un usuario/sede nueva en Siigo), corre este script y lee la consola —
+no adivines ids a mano ni copies los valores de ejemplo de
+`siigo_test/frontend/src/pages/InvoiceTest.jsx` (esos nunca se confirmaron
+contra una respuesta real).
+
+**Hallazgo clave que cambió el diseño**: el vendedor (`seller`) y el tipo de
+documento/resolución electrónica (`document.id`) en Siigo son **por sede**,
+no un id único para toda la cuenta — se confirmó viendo `GET /v1/users`
+devolver un usuario Siigo por punto de venta (`usuarioboulevard@gmail.com`,
+`usuariocentrosur@gmail.com`, `usuarioholguines@gmail.com`, coincidiendo
+con nombres reales de sedes como "Mecatos el Santi Boulevard"). Por eso
+`seller`/`document.id` **no son variables de entorno globales** — viven en
+`Branch.dianConfig.siigoSellerId`/`siigoDocumentId` (nuevos campos, junto a
+`prefix`/`resolutionNumber`/`from`/`to`/`current`/`techKey` que ya existían
+para una integración directa con la DIAN que nunca se llegó a usar).
+`siigoEmit` hace `Branch.findById(sale.branchId)` y rechaza con
+`REJECTED` + mensaje claro si a esa sede le falta cualquiera de los dos —
+igual que con `dianResponsible`, cada sede se configura por separado.
+`admin-frontend`/`DianConfig.tsx` (ver ese archivo, sección "Integración
+Siigo (PTA)") ya expone ambos campos por sede — usa `npm run test:siigo`
+para saber qué valores poner ahí antes de activarlos.
+
+**⚠️ Deuda técnica a propósito, contradice el "por sede" de arriba**:
+`createBranch` (`adminController.ts`) ahora rellena
+`dianConfig.siigoSellerId`/`siigoDocumentId` con un default fijo
+(`1032`/`32502`, los mismos de "Boulevard") en cuanto se crea una sede
+nueva marcada `dianResponsible` — `BranchModal.tsx` (el formulario de
+crear/editar sede) no expone ningún campo de Siigo, así que sin este
+default una sede nueva quedaba con `dianConfig` vacío y **cualquier
+venta suya rechazaba en `siigoEmit`** hasta que un admin entrara a mano a
+`DianConfig.tsx` a completarlo. El efecto real: mientras esto no se
+resuelva de verdad, **todas las sedes `dianResponsible` (no solo
+Boulevard) emiten facturas atribuidas al mismo vendedor/resolución de
+Siigo** — el "por sede" de arriba deja de ser cierto en la práctica para
+cualquier sede nueva hasta que alguien dé de alta un vendedor/resolución
+real para ella en la cuenta de Siigo y lo actualice a mano en
+`DianConfig.tsx` (que sigue funcionando igual para sobreescribir el
+default). Revisar esto antes de que el negocio realmente opere una
+segunda sede `dianResponsible` — hoy solo existe una sede real operando
+así ("Boulevard"), así que el default no se ha notado todavía en la
+práctica.
+
+**Mapeo de producto → Siigo**: `Product.siigoCode` (nuevo campo opcional en
+`models/Product.ts`) es el código del producto en el catálogo de Siigo (ej.
+`"cpfma01"`). `siigoEmit` busca los `Product` de los items de la venta y
+rechaza con `REJECTED` (mensaje con el nombre del producto sin mapear) si
+alguno no tiene `siigoCode` — no hay fallback ni adivinanza. Como con
+`REJECTED` por cualquier otra razón (punto 3), esto no se reintenta solo:
+alguien tiene que completar el `siigoCode` desde Inventario y reencolar a
+mano. Hoy no existe UI en `ProductModal.tsx` para editar `siigoCode` — se
+edita directo en Mongo hasta que se decida si vale la pena agregar ese
+campo al formulario.
+
+**Catálogo real ya importado** — 44 productos reales (export de Siigo,
+columnas Código/Nombre/Precios) se cargaron directo a Mongo con
+`Product.siigoCode` = Código de Siigo, `sku` generado con el mismo
+algoritmo de `createProduct` (punto 14), impuestos/stock del export
+ignorados a propósito (el negocio no declara impuestos, y el stock se
+carga aparte a mano). Categoría (`FRITANGA`/`ALMUERZOS`/`BEBIDAS`/`OTRO`)
+se infirió del nombre de cada producto — el export no traía esa columna,
+así que si un producto quedó mal categorizado, es un dato a corregir desde
+Inventario, no un bug. El script de importación fue de una sola corrida y
+se borró después de usarse (mismo patrón que `runReconciliation.ts`/
+`seed.ts` pero sin quedar como comando permanente) — si hace falta
+importar otro lote, replica el mismo mapeo (Código→siigoCode,
+Nombre→name, Precios→price, SKU autogenerado) en vez de inventar un
+formato nuevo.
+
+**Impuestos: `taxes: []` por default, no `[{id: 256}]` como en
+`siigo_test`** — el negocio no declara/cobra impuestos (`Sale.tax` siempre
+0, ver punto 65), así que el payload real omite `taxes` en cada item en vez
+de copiar el 8% de Impoconsumo que el proyecto de exploración usaba para
+probar. `SIIGO_ITEM_TAX_ID` (env var) existe por si el negocio decide más
+adelante declarar Impoconsumo a través de Siigo — mientras esté vacía, el
+comportamiento es "sin impuesto", consistente con el resto del sistema.
+
+**Forma de pago → id de Siigo**: `SIIGO_PAYMENT_ID_<PAYMENT_METHOD>` (una
+env var por valor del enum `PaymentMethod`) — `SIIGO_PAYMENT_ID_CASH=100`/
+`SIIGO_PAYMENT_ID_EFECTIVO=100` ("Efectivo", mismo id real, dos nombres de
+env var porque `CASH`/`EFECTIVO` son dos valores de enum distintos tras el
+refactor del punto 34 — ver ese punto) y `SIIGO_PAYMENT_ID_NEQUI=10023`
+("Nequi") ya están puestos con ids reales verificados por
+`npm run test:siigo`. **Ya resuelto** (antes pendiente): `Sale.paymentMethod`
+ya no escribe `DELIVERY_APP` en ventas nuevas — el reemplazo `BANCOLOMBIA`
+mapea a `SIIGO_PAYMENT_ID_BANCOLOMBIA=105` ("Transferencia Bancolombia",
+ya existía en el catálogo real, sin usar hasta el punto 34). **Sigue
+pendiente**: `SIIGO_PAYMENT_ID_CARD` — el catálogo real de la cuenta no
+tiene "Tarjeta Débito/Crédito" activas; decisión de negocio pendiente, no
+un olvido (irrelevante en la práctica ya que `CARD` es legacy-only, nunca
+se ofrece en ninguna venta nueva). Sin el mapeo para el método de la
+venta, `siigoEmit` rechaza con mensaje claro en vez de adivinar un id.
+
+**Cliente por default**: si `Sale.customer.document` no viene (venta sin
+datos de cliente, el caso normal de un Documento POS Electrónico),
+`buildSiigoInvoicePayload` usa `SIIGO_DEFAULT_CUSTOMER_ID` (default
+`"222222222222"`, el NIT genérico de "consumidor final" en Colombia). **No
+verificado todavía**: si `Sale.customer.document` SÍ viene (Factura
+Nominal, ver punto 35), se manda tal cual como `customer.identification` —
+pero no se confirmó que Siigo acepte una identificación que no exista ya
+como cliente registrado en su catálogo (`GET /v1/customers`); si Siigo la
+rechaza, esa venta queda `REJECTED` y necesitará revisión manual hasta que
+se resuelva (¿crear el cliente en Siigo antes de facturar? ¿ese endpoint lo
+permite inline?) — pendiente de probar con una Factura Nominal real.
+
+**Token de Siigo cacheado en memoria del proceso** (`cachedSiigoToken` en
+`dianService.ts`, variable de módulo) — evita loguearse contra `/auth` en
+cada venta que procese el worker. `SIIGO_TOKEN_TTL_MINUTES` (default 12h)
+es conservador porque Siigo no documenta la duración exacta del token; si
+una request real responde 401 con el token cacheado, `siigoEmit` limpia el
+cache y reintenta una sola vez con un token fresco antes de rendirse.
+
+**Forma de la respuesta de Siigo — ya verificada contra facturas reales
+(`GET /v1/invoices`)**: `qrCodeUrl` es el campo top-level **`public_url`**
+(link al documento/QR hospedado por Siigo) — **NO** `stamp.qr_code` ni
+`stamp.pdf.file_url`, que fue la suposición inicial sin verificar y
+resultó estar mal (esos campos no existen en la respuesta real). `cufe` SÍ
+está en `stamp.cufe` como se había supuesto — el nombre del campo estaba
+bien, el problema era otro (ver siguiente punto).
+
+**`Sale.dianInvoiceNumber`** — el campo `name` de la respuesta de Siigo
+(ej. `"FV-3-7"`), el número REAL de factura que Siigo/DIAN asignan.
+Viene ya en la respuesta inicial del `POST` (no hace falta esperar el
+poll del CUFE para tenerlo, a diferencia de `cufe`). Se agregó junto con
+el rediseño del recibo (ver más abajo) — antes no se persistía en
+ningún lado pese a que `SaleReceipt.tsx` ya necesitaba mostrarlo.
+
+**Rediseño del recibo (pantalla + ticket térmico) para mostrar el bloque
+DIAN real** — antes ninguno de los dos (`SaleReceipt.tsx` ×2 copias,
+`pos-printer-server/index.js`) leía `cufe`/`qrCodeUrl` para nada, pese a
+que ya estaban en el modelo desde la integración con Siigo; ambos
+mostraban siempre "Factura electrónica en proceso de validación DIAN."
+sin importar el estado real. Ahora:
+- `SaleReceipt.tsx` calcula `showDianBlock = sale.dianStatus ===
+  "APPROVED" && Boolean(sale.cufe)` **una sola vez** y lo manda en el
+  `PrintReceiptPayload` — `pos-printer-server` no reimplementa esa
+  condición, solo lee el booleano (ver punto 32 en
+  `pos-printer-server/CLAUDE.md` para el detalle completo del lado del
+  ticket físico/QR/`qr-image`).
+- Cuando `true`: NIT (constante hardcodeada `1144209364-9` en las 3
+  copias del recibo, no varía por sede — confirmado contra facturas
+  reales ya aprobadas por la DIAN de esta cuenta Siigo), "Factura
+  electrónica de venta No. {dianInvoiceNumber}", CUFE, un QR (codifica
+  `qrCodeUrl`, el link de Siigo al documento — no un QR generado a partir
+  del CUFE solo), el aviso legal de letra de cambio (Ley 1231 de 2008),
+  atribución a Siigo S.A.S. como PTA, y — solo si
+  `Branch.dianConfig.resolutionNumber` está poblado (hoy vacío en todas
+  las sedes) — la línea de Resolución DIAN.
+- **A propósito NO se incluyó una tabla de Impuestos/Impoconsumo** — el
+  PDF de Siigo que sirvió de referencia para este rediseño sí la traía,
+  pero era de una factura vieja (de antes de este refactor, con un 8%
+  hardcodeado por `siigo_test`) — el negocio sigue sin declarar/cobrar
+  impuestos (`Sale.tax` siempre 0, punto 65), así que replicar esa tabla
+  habría sido inconsistente con el resto del sistema.
+- Cuando `false` (PENDING/SENT/REJECTED, o un mock sin cufe): el mensaje
+  genérico de siempre, sin cambios.
+- `qrcode.react` (nueva dependencia de `frontend/package.json`,
+  `QRCodeSVG`) renderiza el QR en pantalla — no existía ninguna librería
+  de QR en el proyecto antes de esto.
+
+**El timbrado de Siigo es ASÍNCRONO — el `POST /v1/invoices` puede
+responder OK antes de que DIAN confirme el CUFE.** Se confirmó con una
+factura real: el `POST` devolvió `response.ok: true` pero `stamp.cufe`
+venía vacío en ese mismo body; consultando la misma factura un momento
+después por `GET /v1/invoices/:id`, `stamp.cufe` ya estaba poblado
+(`stamp.status` pasó de lo que sea que traía al crear a `"Accepted"`).
+`siigoEmit` ahora reconsulta la factura por su `id` (que si viene en la
+respuesta del POST) hasta `SIIGO_STAMP_POLL_ATTEMPTS` veces (default 5,
+cada `SIIGO_STAMP_POLL_DELAY_MS` ms, default 2000 → ~10s en total) antes de
+darse por vencido. Si el CUFE sigue sin aparecer tras el poll, la venta
+queda **`APPROVED` con `cufe` vacío** (no `REJECTED`) — a propósito: la
+factura YA se creó/timbró en Siigo en ese punto, así que un `REJECTED`
+dispararía un reintento de BullMQ que crearía una **segunda factura real**
+para la misma venta. Queda un `console.warn` con el id de la factura de
+Siigo para revisión manual si eso llega a pasar.
+
+**⚠️ Consecuencia real de probar esto con la cuenta de producción**:
+durante las pruebas de esta integración se crearon **facturas reales,
+timbradas ante la DIAN**, en la cuenta de Siigo — algunas de cantidades
+ficticias (ej. "10× empanada pequeña") sin venta real detrás, y al menos
+una de ellas **sin ningún `Sale` correspondiente en Mongo** (se creó
+llamando la integración directo, no a través del flujo real de venta). Un
+`Sale` cancelado o borrado en Mongo **no anula la factura en Siigo/DIAN**
+— para eso Siigo requiere una **Nota Crédito** por cada factura a anular,
+una acción contable, no algo que se resuelva editando la base de datos de
+este proyecto. **Antes de volver a probar `DIAN_PROVIDER=SIIGO` contra esta
+cuenta, considera volver a `MOCK`** salvo que la intención sea generar una
+factura real de verdad — no hay "modo sandbox" de Siigo separado con estas
+credenciales.
 
 ### 14. El SKU de producto se genera en el backend, nunca se recibe del cliente
 
@@ -416,74 +645,152 @@ resumen, mostrando "No hay ventas registradas" con el resumen de al lado
 mostrando totales reales. Si vuelves a acotar ese rango de horas, ten en
 cuenta que le vuelve a introducir ese mismo bug.
 
-### 34. Ventas por DELIVERY_APP (Rappi/DiDi) nacen `PENDING_PAYMENT` — es Cuentas por Cobrar hasta que el agregador liquida
+### 34. Ventas Rappi/DiDi nacen `PENDING_PAYMENT` bajo Bancolombia — canal-driven, NO paymentMethod-driven (reescrito — reemplaza el diseño original)
 
-Rappi/DiDi cobran al cliente y le depositan el dinero a la panadería días
-después, a diferencia de CASH/NEQUI/CARD que se dan por cobrados el mismo
-día. `Sale.paymentStatus` (`"COMPLETED" | "PENDING_PAYMENT"`, con
-`settlementDate?: Date`, ver `backend/src/models/Sale.ts`) modela esto.
+**Reescrito por completo.** El diseño original de este punto (trigger por
+`paymentMethod === "DELIVERY_APP"`, explícitamente NO por `orderType`) fue
+revertido a propósito, a pedido explícito, como parte de un refactor más
+amplio que separó "método de pago" (destino real del dinero) de "canal de
+venta" (`Sale.orderType`). Se documenta la reversión en vez de borrar el
+razonamiento anterior porque el motivo original seguía siendo válido — se
+aceptó el trade-off a sabiendas, no por descuido.
 
-**El trigger es `paymentMethod === "DELIVERY_APP"`, NO `orderType ===
-"DIDI"`** — ojo con esta distinción, es una trampa real: `orderType`
-(`POS_COUNTER`/`RAPPI`/`DIDI`/`DELIVERY_LOCAL`) es el *canal* por el que
-llegó el pedido, y `paymentMethod` (`CASH`/`NEQUI`/`CARD`/`DELIVERY_APP`) es
-*cómo se cobró* — son campos independientes, una venta con `orderType:
-"DIDI"` perfectamente podría tener `paymentMethod: "CASH"` (el domiciliario
-cobra en efectivo contra entrega) y esa sí se cobró el mismo día, no debería
-quedar `PENDING_PAYMENT`. Este punto se decidió explícitamente así (no por
-descuido) tras confirmar que ni Rappi ni DiDi existen como valor de
-`paymentMethod` — solo `DELIVERY_APP` cubre ambos agregadores como forma de
-pago.
+**Motivo original (ya no aplica, pero que quede constancia)**: un domicilio
+DiDi podía cobrarse en efectivo contra entrega, así que gatear por
+`orderType === "DIDI"` habría marcado `PENDING_PAYMENT` una venta que en
+realidad ya se cobró el mismo día. Por eso el diseño original usaba
+`paymentMethod === "DELIVERY_APP"` en su lugar.
 
-- **`resolvePaymentStatus(paymentMethod)`** (exportada desde
-  `backend/src/models/Sale.ts`, junto al modelo) es el único punto de
-  verdad: `"DELIVERY_APP"` → `"PENDING_PAYMENT"`, cualquier otro valor →
-  `"COMPLETED"`. La usan los 3 sitios que llaman `Sale.create`
-  (`posController.createSale`, `posController.syncOfflineSales`,
-  `adminController.createSaleAdmin`) para fijar el valor inicial, y
-  `adminController.updateSaleAdmin` la vuelve a llamar si el admin edita
-  `paymentMethod` a un valor distinto del que ya tenía (comparación
-  explícita, no solo "si vino en el body" — si no, reenviar el mismo
-  formulario sin tocar ese campo resetearía `paymentStatus`/
-  `settlementDate` sin necesidad). Si vuelve a un método que no es
-  `DELIVERY_APP`, limpia `settlementDate` (la liquidación anterior, si la
-  hubo, ya no aplica).
+**Diseño actual**: **cualquier venta con `orderType` `"RAPPI"` o `"DIDI"`
+SIEMPRE fuerza `paymentMethod: "BANCOLOMBIA"` + `paymentStatus:
+"PENDING_PAYMENT"`, sin importar cómo se cobró en la calle** — incluyendo
+el caso de cobro en efectivo contra entrega que el diseño anterior evitaba
+a propósito. Rappi recibe el mismo tratamiento que DiDi (antes solo DiDi
+se mencionaba en el ejemplo del pedido, pero como ambos ya compartían
+`DELIVERY_APP`, se decidió que ambos compartan también el nuevo
+comportamiento).
+
+**`Sale.paymentMethod` — valores nuevos, sin migrar los viejos**: el enum
+ahora es `"CASH" | "NEQUI" | "CARD" | "DELIVERY_APP" | "EFECTIVO" |
+"BANCOLOMBIA"` (`backend/src/models/Sale.ts`). `CASH`/`DELIVERY_APP`
+quedaron legacy-only (mismo tratamiento que `CARD` ya tenía, ver punto 61)
+— ninguna venta nueva los escribe, pero **no hubo migración de datos**:
+las ventas históricas siguen con sus valores viejos para siempre. Para que
+todo lo que suma/filtra/agrupa por método de pago trate lo viejo y lo
+nuevo como lo mismo, `Sale.ts` exporta:
+
+- **`PAYMENT_METHOD_GROUP`**: `Record<PaymentMethod, PaymentMethodGroup>`
+  — `CASH`/`EFECTIVO` → `CASH_GROUP`, `NEQUI` → `NEQUI_GROUP`, `CARD` →
+  `CARD_GROUP`, `DELIVERY_APP`/`BANCOLOMBIA` → `BANCOLOMBIA_GROUP`. Único
+  punto de verdad — úsalo en vez de comparar strings crudos en cualquier
+  lugar nuevo que sume por método de pago.
+- **`isDeliveryAppChannel(orderType)`**: `orderType === "RAPPI" ||
+  orderType === "DIDI"`.
+- **`resolvePaymentMethodForChannel(orderType, requestedPaymentMethod)`**:
+  fuerza `"BANCOLOMBIA"` si `isDeliveryAppChannel`, si no respeta lo
+  pedido. Server-side siempre — el frontend también bloquea/oculta el
+  selector cuando el canal es Rappi/DiDi (ver más abajo), pero es defensa
+  en profundidad, no la fuente de verdad.
+- **`resolvePaymentStatus(orderType)`** — **firma cambiada**: antes tomaba
+  `paymentMethod` (comparaba contra `"DELIVERY_APP"`), ahora toma
+  `orderType`. Los 4 sitios que la llaman
+  (`posController.createSale`/`syncOfflineSales`,
+  `adminController.createSaleAdmin`/`updateSaleAdmin`) resuelven primero
+  el `orderType` EFECTIVO (del body, o el que ya tenía la venta en
+  `updateSaleAdmin`) y derivan método/estado a partir de ese — así cambiar
+  solo el canal (sin tocar `paymentMethod` en el body) también dispara el
+  forzado a Bancolombia.
+
+**Ya no hace falta migrar `Product.siigoCode`/mapeo de Siigo por esto** —
+al contrario, esto lo resolvió: `SIIGO_PAYMENT_ID_BANCOLOMBIA=105`
+("Transferencia Bancolombia") ya existía sin usar en el catálogo real de
+la cuenta (ver punto 10), y `SIIGO_PAYMENT_ID_EFECTIVO=100` reutiliza el
+mismo id real que `CASH` (mismo método real en Siigo, solo cambió la
+etiqueta interna del proyecto).
+
+**Filtrado (`listSales`)**: pedir `paymentMethod=EFECTIVO` en el filtro
+ahora expande a un `$in` con todo el grupo (`CASH` incluido) vía
+`PAYMENT_METHOD_GROUP` — filtrar por el valor nuevo también trae ventas
+viejas, sin necesitar exponer `CASH`/`DELIVERY_APP` como opciones de
+filtro separadas en la UI.
+
+**"Cuentas por cobrar (DiDi)" en el dashboard (`getDashboardMetrics`)**:
+el aggregate ya NO filtra por `paymentMethod: "DELIVERY_APP"` — solo por
+`paymentStatus: "PENDING_PAYMENT"`, que ahora es 100% señal del canal.
+Captura Rappi + DiDi, viejo + nuevo, sin enumerar valores.
+
 - **Confirmación manual, no hay forma automática de saberlo**: `PATCH
   /api/admin/sales/:id/confirm-payment` (`confirmSalePayment` en
   `adminController.ts`, `requireRole("ADMIN", "MANAGER")`, mismo chequeo de
   sede que `cancelSaleAdmin`/`updateSaleAdmin` para MANAGER) pone
   `paymentStatus: "COMPLETED"` y `settlementDate: new Date()`. Rechaza con
-  400 si la venta no está `PENDING_PAYMENT` (evita reconfirmar o confirmar
-  una venta que nunca lo estuvo). No hay integración con Rappi/DiDi ni con
-  el banco — un humano lo confirma al ver el depósito reflejado en el
-  extracto bancario.
+  400 si la venta no está `PENDING_PAYMENT`. Sin cambios por este
+  refactor — sigue funcionando igual sin importar si la venta quedó
+  pendiente por `DELIVERY_APP` (vieja) o por canal Rappi/DiDi (nueva). No
+  hay integración con Rappi/DiDi ni con el banco — un humano lo confirma
+  al ver el depósito reflejado en el extracto bancario.
 - **El arqueo de turno del cajero (`computeShiftFinancials`,
-  `cashClosureController.ts`) YA excluía `DELIVERY_APP` del efectivo/Nequi
-  esperado, sin necesidad de ningún cambio para este punto**: agrupa ventas
-  por `paymentMethod` en 4 baldes disjuntos (`cashSales`/`cardTotal`/
-  `nequiTotal`/`appsTotal`), y `systemCalculatedCash`/`systemCalculatedNequi`
-  (lo que el cajero cuenta físicamente al cerrar turno, ver punto 29 en
-  `admin-frontend/src/cajero/CLAUDE.md`) solo usan los baldes de
-  `CASH`/`NEQUI` — `appsTotal` nunca entra ahí. No lo "arregles" pensando
-  que falta excluirlo; ya estaba excluido antes de que existiera
-  `paymentStatus`, porque el efectivo/Nequi físico nunca incluyó ventas de
-  apps para empezar.
-- **Google Sheets**: `logSaleToSheets` (`utils/sheetsSync.ts`) manda
-  `paymentStatus` en el payload de `LOG_TRANSACTION`, y el `Code.gs` de
-  referencia (`docs/GOOGLE_SHEETS_INTEGRATION.md`) escribe una columna
-  `Payment_Status` en `OPERATIONAL_LOGS`. Como esa pestaña es append-only
-  (ver punto 22 en `admin-frontend/CLAUDE.md`), confirmar el pago después
-  con el endpoint de arriba **no reescribe** la fila ya loggeada — el
-  sheet solo refleja el estado al momento de crearse la venta, no el
-  estado actual. Si en algún momento se necesita que Sheets refleje
-  confirmaciones posteriores, hay que decidir aparte cómo (¿una segunda
-  fila de "ajuste"? ¿una pestaña nueva de conciliación?) — no está
-  resuelto, y no se inventó un mecanismo para esto sin que se pidiera
-  explícitamente.
+  `cashClosureController.ts`) — SÍ necesitó cambiar esta vez**: antes
+  agrupaba por comparación exacta de string (`s.paymentMethod === "CASH"`,
+  etc.); ahora usa `PAYMENT_METHOD_GROUP[s.paymentMethod] ===
+  "CASH_GROUP"` (y análogos para `NEQUI_GROUP`/`CARD_GROUP`/
+  `BANCOLOMBIA_GROUP`) — sin este cambio, una venta `EFECTIVO` real habría
+  desaparecido silenciosamente del efectivo esperado del cajero al cerrar
+  turno. `systemCalculatedCash`/`systemCalculatedNequi` (ver punto 29 en
+  `admin-frontend/src/cajero/CLAUDE.md`) siguen sin incluir
+  `BANCOLOMBIA_GROUP`, mismo criterio de siempre (el dinero de
+  Rappi/DiDi/Bancolombia nunca fue efectivo/Nequi físico en la gaveta).
+- **Google Sheets**: sin cambios — `logSaleToSheets` sigue mandando
+  `paymentMethod`/`paymentStatus` crudos (los valores nuevos simplemente
+  aparecen como strings nuevos en esa columna, `OPERATIONAL_LOGS` es
+  append-only, ver punto 22 en `admin-frontend/CLAUDE.md`, así que no hay
+  nada que romper ahí).
+- **Dashboard/Reportes**: `getDashboardMetrics` y `reportController.ts`
+  (`salesByMethod`) ahora agrupan por `PAYMENT_METHOD_GROUP` antes de
+  etiquetar, así que una venta vieja y su equivalente nueva caen en la
+  misma fila del desglose ("Efectivo", "Nequi / Daviplata", "Bancolombia /
+  Delivery Apps (Rappi/DiDi)") en vez de aparecer duplicadas. Las columnas
+  por fila del Excel/PDF (`Canal`/`Método`) siguen mostrando el valor
+  crudo tal cual está guardado — ahí sí importa la precisión histórica.
+
+**Frontend — `activePaymentMethods` vs. `paymentMethodLabels`
+(`frontend/src/components/SaleReceipt.tsx`, con copia en
+`frontend/src/cajero/components/SaleReceipt.tsx`)**: mismo patrón que ya
+existía para ocultar `CARD` (ver punto 61), extendido ahora a `CASH`/
+`DELIVERY_APP`. `paymentMethodLabels` es el mapa COMPLETO (incluye
+valores históricos, para mostrar recibos/tablas de ventas viejas con una
+etiqueta bonita en vez del valor crudo); `activePaymentMethods` (nuevo,
+solo `EFECTIVO`/`NEQUI`/`BANCOLOMBIA`) es lo que alimenta los `<select>`
+de crear/editar venta (`SaleModal.tsx`, `SaleEditModal.tsx`) — así
+`CASH`/`DELIVERY_APP` dejan de ofrecerse como opción nueva sin dejar de
+mostrarse bien en ventas ya guardadas. `Ventas.tsx` sigue con su propio
+mapa local (ya era intencionalmente distinto, ver el comentario en ese
+archivo) más un `paymentMethodFilterOptions` nuevo (solo los 3 valores
+activos) para sus dos `<select>` de filtro — filtrar por el valor nuevo
+también trae lo viejo gracias al `$in` por grupo del backend.
+
+**UI de canal Rappi/DiDi, nueva**:
+- `frontend/src/cajero/components/PaymentPanel.tsx` — toggle "Pedido
+  DiDi" (separado de los 3 botones de método de pago: Efectivo/Nequi/
+  Bancolombia). Encendido fuerza/bloquea la selección a Bancolombia y
+  manda `orderType: "DIDI"` — antes el cajero SIEMPRE mandaba
+  `orderType: "POS_COUNTER"` hardcodeado, esta es la primera vez que el
+  cajero puede elegir canal desde la Caja.
+- `frontend/src/components/SaleModal.tsx` (admin "Agregar venta") —
+  checkbox "Procesado por DiDi" equivalente, manda `orderType: "DIDI"`.
+- `frontend/src/components/SaleEditModal.tsx` — cuando el `<select>` de
+  Canal está en `DIDI`/`RAPPI`, el selector de método de pago se
+  reemplaza por un aviso de que quedó bloqueado en Bancolombia (el
+  backend lo fuerza igual, esto es solo para que la UI no prometa algo
+  distinto de lo que va a quedar guardado).
 
 *(La UI de "Confirmar Pago" — badge en `Ventas.tsx`, ítem del `ActionsMenu`
 — vive en `admin-frontend/CLAUDE.md`, ya que es exclusiva del panel admin,
-a propósito no está en `/cajero/facturas`.)*
+a propósito no está en `/cajero/facturas`. `Ventas.tsx` calcula un
+`isDeliveryAppSale` local por fila —
+`paymentMethod === "DELIVERY_APP" || "BANCOLOMBIA" || orderType === "DIDI"
+|| "RAPPI"` — para el badge y la condición de "Confirmar Pago", cubriendo
+todas las combinaciones viejo/nuevo.)*
 
 ### 35. Factura Electrónica Nominal también es opcional para el cliente — ver `admin-frontend/src/cajero/CLAUDE.md`
 
@@ -1145,3 +1452,58 @@ punto (una venta de prueba real mostró `$NaN` en su único ítem) — no se
 corrigió porque es un bug distinto, sin relación con impuestos, y tocar
 la construcción de ítems de venta amerita su propio cambio deliberado,
 no colarlo dentro de esta corrección.
+
+### 66. Carga Masiva de inventario — matriz producto x sede, `$set` exacto sobre muchos productos a la vez
+
+Extensión multi-producto de `setProductStock`/`ManagedStockModal.tsx`
+(punto 60, referenciado en varios comentarios pero documentado en el
+archivo que no existe en este checkout — ver la nota al respecto en
+`frontend/CLAUDE.md`, creado junto con este punto). Antes, corregir
+stock de varios productos a la vez significaba abrir "Gestionar
+inventario" una vez por producto — esto lo hace en una sola pantalla.
+
+- **`GET /api/admin/products/stock/matrix`** (`getStockMatrix`,
+  `adminController.ts`) — trae TODO el catálogo activo + TODAS las sedes
+  activas + TODOS los `ProductStock` relevantes en 2 queries (`Product.find`
+  + `Branch.find` en paralelo, luego un solo `ProductStock.find({productId:
+  {$in: productIds}})`), a diferencia de `buildProductStockSummary`
+  (usado por `getProductStock`), que hace un `ProductStock.find` por
+  producto — reusarlo en loop para ~44+ productos habría sido un N+1 real.
+  Devuelve `{ products, branches, stock }` con `stock` como
+  `{[productId]: {[branchId]: quantity}}` — un (producto, sede) sin
+  documento de `ProductStock` simplemente no aparece ahí, el frontend
+  asume `0`.
+- **`PUT /api/admin/products/stock/bulk`** (`bulkSetProductStock`) — misma
+  semántica `$set` exacta que `setProductStock` (no `$inc`), pero el body
+  es `{ updates: [{productId, branchId, quantity}] }` en vez de estar
+  scopeado a un solo `productId` en la URL. Valida que todos los
+  `productId`/`branchId` referenciados existan/estén activos (mismo
+  patrón `Branch.countDocuments({_id:{$in:...}, status:true})` que ya
+  usaba `setProductStock`, extendido con un chequeo análogo para
+  productos) antes de escribir nada — todo o nada a nivel de validación,
+  aunque los `$set` en sí corren en paralelo sin transacción (mismo
+  criterio que el resto del proyecto, que no usa transacciones
+  multi-documento, ver el comentario correspondiente en
+  `createSaleAdmin`). `requireRole("ADMIN")` — igual que
+  `setProductStock`, nunca MANAGER.
+- **Ambas rutas van registradas ANTES de `/products/:id/stock` en
+  `adminRoutes.ts`, pero verificado (no solo supuesto) que en realidad NO
+  hace falta ese orden** — `/products/:id/stock` exige que el ÚLTIMO
+  segmento sea literalmente `"stock"`, y en `/products/stock/matrix`/
+  `/products/stock/bulk` la palabra `"stock"` va en el segmento del
+  medio, así que Express nunca las confunde sin importar el orden de
+  registro. Quedaron arriba solo por cercanía/legibilidad con el resto de
+  rutas de productos. Si en algún momento se agrega una ruta literal que
+  SÍ termine en `/stock` (ej. `/products/stock`), esa sí necesitaría ir
+  antes de `/products/:id/stock` de verdad — confirmarlo con una prueba
+  real antes de asumirlo, como se hizo acá (un intento inicial de
+  documentar esto asumió una colisión que en la práctica no existe).
+- **El frontend solo manda las celdas que el admin realmente editó**
+  (`BulkStockModal.tsx`, `edits` separado del snapshot `originalStock`),
+  no la grilla completa — evita que guardar la carga masiva pise una
+  celda que otro admin haya tocado en paralelo desde
+  `ManagedStockModal.tsx` mientras el modal estaba abierto.
+- **Botón "Carga Masiva" en `Inventario.tsx`** — solo ADMIN, y solo en el
+  toolbar de escritorio (omitido a propósito del bloque de celular: una
+  tabla con una columna por sede activa no es usable en pantalla
+  angosta).

@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { CashClosure, ICashClosure, IStockVerification } from "../models/CashClosure";
-import { Sale } from "../models/Sale";
+import { Sale, PAYMENT_METHOD_GROUP } from "../models/Sale";
 import { Expense } from "../models/Expense";
 import { Purchase } from "../models/Purchase";
 import { User } from "../models/User";
@@ -39,17 +39,23 @@ async function computeShiftFinancials(shift: ICashClosure, endDate?: Date) {
     createdAt: createdAtFilter,
   });
 
+  // Agrupa por PAYMENT_METHOD_GROUP (ver Sale.ts), no por el valor crudo —
+  // así una venta `EFECTIVO` (nueva) cuenta igual que una `CASH` (vieja)
+  // para el efectivo esperado del turno, y una `BANCOLOMBIA` cuenta igual
+  // que una `DELIVERY_APP` vieja. Sin esto, una venta EFECTIVO real
+  // desaparecería silenciosamente del arqueo del cajero — ver punto 34 de
+  // CLAUDE.md.
   const cashSales = sales
-    .filter((s) => s.paymentMethod === "CASH")
+    .filter((s) => PAYMENT_METHOD_GROUP[s.paymentMethod] === "CASH_GROUP")
     .reduce((acc, s) => acc + s.total, 0);
   const cardTotal = sales
-    .filter((s) => s.paymentMethod === "CARD")
+    .filter((s) => PAYMENT_METHOD_GROUP[s.paymentMethod] === "CARD_GROUP")
     .reduce((acc, s) => acc + s.total, 0);
   const nequiTotal = sales
-    .filter((s) => s.paymentMethod === "NEQUI")
+    .filter((s) => PAYMENT_METHOD_GROUP[s.paymentMethod] === "NEQUI_GROUP")
     .reduce((acc, s) => acc + s.total, 0);
   const appsTotal = sales
-    .filter((s) => s.paymentMethod === "DELIVERY_APP")
+    .filter((s) => PAYMENT_METHOD_GROUP[s.paymentMethod] === "BANCOLOMBIA_GROUP")
     .reduce((acc, s) => acc + s.total, 0);
 
   const pettyCashExpenses = (

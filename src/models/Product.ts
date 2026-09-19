@@ -29,6 +29,12 @@ export interface IProduct extends Document {
   // sede seleccionada (o la suma de todas si no hay ninguna elegida),
   // mismo criterio que ya usa la columna "Stock" de Inventario.tsx.
   minStock: number;
+  // Código del producto en el catálogo de Siigo (ej. "cpfma01") — necesario
+  // para emitir la venta como factura electrónica (ver dianService.ts,
+  // integración SIIGO). `undefined` mientras el producto no se haya
+  // registrado/mapeado en Siigo todavía; una venta con un producto sin este
+  // código queda dianStatus: REJECTED con un mensaje claro, no se adivina.
+  siigoCode?: string;
 }
 
 const ModifierSchema = new Schema<IModifier>(
@@ -56,6 +62,7 @@ const ProductSchema = new Schema<IProduct>(
     recipe: { type: [RecipeItemSchema], default: [] },
     active: { type: Boolean, default: true },
     minStock: { type: Number, default: 0, min: 0 },
+    siigoCode: { type: String },
   },
   { timestamps: true }
 );

@@ -25,6 +25,7 @@ async function processJob(job: Job<DianJobData>) {
     sale.dianStatus = "APPROVED";
     sale.cufe = result.cufe;
     sale.qrCodeUrl = result.qrCodeUrl;
+    sale.dianInvoiceNumber = result.invoiceNumber;
     await sale.save();
     console.log(`[DianWorker] Venta ${sale._id} aprobada. CUFE: ${result.cufe}`);
   } else {

@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { Product } from "../models/Product";
 import { ProductStock } from "../models/ProductStock";
-import { Sale, resolvePaymentStatus } from "../models/Sale";
+import { Sale, resolvePaymentStatus, resolvePaymentMethodForChannel } from "../models/Sale";
 import { Branch } from "../models/Branch";
 import { Expense } from "../models/Expense";
 import { StockLoss } from "../models/StockLoss";
@@ -106,8 +106,8 @@ export async function createSale(req: Request, res: Response) {
     offlineCreated,
     localTicketId,
   } = req.body;
-  const THIRTY_MINUTES = 2 * 60 * 1000;
-  const MAX_GROUP_1 = 509000;
+  const THIRTY_MINUTES = Number(process.env.THIRTY_MINUTES);
+  const MAX_GROUP_1 = Number(process.env.MAX_GROUP_1);
   let category: string = "REGULAR";
   let hasSpace: boolean = false;
   let thirtyMinutesPassed: boolean = false;
@@ -233,13 +233,15 @@ export async function createSale(req: Request, res: Response) {
   // createSaleAdmin): si el descuento fallara a mitad de camino, es
   // preferible tener el registro de venta para reconciliar a mano que
   // perder stock sin ninguna venta que lo explique.
+  const effectiveOrderType = orderType || "POS_COUNTER";
+
   const sale = await Sale.create({
     branchId: posSession.branchId,
     cashierId: posSession.cashierId,
-    orderType: orderType || "POS_COUNTER",
+    orderType: effectiveOrderType,
     items,
-    paymentMethod,
-    paymentStatus: resolvePaymentStatus(paymentMethod),
+    paymentMethod: resolvePaymentMethodForChannel(effectiveOrderType, paymentMethod),
+    paymentStatus: resolvePaymentStatus(effectiveOrderType),
     subtotal,
     tax,
     total,
@@ -328,13 +330,15 @@ export async function syncOfflineSales(req: Request, res: Response) {
       const total = subtotal;
       const requiresNominal = dianService.requiresNominalInvoice(total);
 
+      const syncOrderType = raw.orderType || "POS_COUNTER";
+
       const sale = await Sale.create({
         branchId: posSession.branchId,
         cashierId: posSession.cashierId,
-        orderType: raw.orderType || "POS_COUNTER",
+        orderType: syncOrderType,
         items: raw.items,
-        paymentMethod: raw.paymentMethod,
-        paymentStatus: resolvePaymentStatus(raw.paymentMethod),
+        paymentMethod: resolvePaymentMethodForChannel(syncOrderType, raw.paymentMethod),
+        paymentStatus: resolvePaymentStatus(syncOrderType),
         subtotal,
         tax,
         total,

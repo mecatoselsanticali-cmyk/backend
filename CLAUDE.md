@@ -1507,3 +1507,41 @@ inventario" una vez por producto — esto lo hace en una sola pantalla.
   toolbar de escritorio (omitido a propósito del bloque de celular: una
   tabla con una columna por sede activa no es usable en pantalla
   angosta).
+
+### 67. `dianWorker.ts` lleva un servidor HTTP mínimo (`GET /health`) para poder desplegarse como Web Service gratis de Render — no es parte de su lógica de negocio
+
+Decisión explícita del negocio, no una sugerencia del código: Render no
+ofrece plan gratis para Background Workers (arrancan en el plan Starter,
+de pago) pero sí para Web Services — con la condición de que el proceso
+abra un puerto HTTP y responda, o el deploy falla con "no open ports
+detected". `dianWorker.ts` agregó un `express()` mínimo, sin ninguna otra
+ruta más que `GET /health` (200, `{status, service, uptime}`), escuchando
+en `process.env.PORT || 3000` — arrancado como lo primero que hace
+`main()`, antes de `connectDB()`, para que el puerto quede abierto lo
+antes posible y no dependa de la latencia de Mongo al conectar.
+
+**Esto NO contradice el punto 5** ("el worker DIAN es un proceso separado
+del API, siempre") — sigue siendo `dianWorker.ts` corriendo solo, nunca se
+mezcló con `server.ts`/`app.ts`. El servidor HTTP es puramente una fachada
+de compatibilidad con el requisito de deploy de Render, no un cambio de
+arquitectura: el worker no expone ningún endpoint de negocio, y el API
+sigue sin saber que el worker tiene un puerto abierto.
+
+**A propósito no lleva `cors`** — mismo criterio que `GET /health` del API
+(punto 58): a este endpoint solo le pega un monitor externo (UptimeRobot o
+similar), no un navegador, así que CORS no aplica.
+
+**Riesgo aceptado explícitamente por el negocio, no un descuido — hay que
+mantener el proceso despierto con un ping externo:** un Web Service
+gratis de Render se suspende tras 15 minutos sin tráfico HTTP entrante.
+Sin un monitor externo pegándole a `/health` con un intervalo menor a eso
+(mismo patrón ya usado para el API, punto 58), el worker se duerme y dos
+cosas dejan de correr mientras tanto: el consumo de la cola BullMQ
+(`dian-emission-*`, ver punto 2) y el `setInterval` de reconciliación
+(punto 3) — ventas cobradas en ese lapso quedan `dianStatus: "PENDING"`
+sin nadie que las procese hasta el siguiente ping que lo despierte. Esto
+se evaluó explícitamente contra usar un Background Worker de pago o
+self-hostear con `docker-compose.yml`, y se decidió aceptar el riesgo por
+el ahorro de costo — si el volumen real de ventas hace que este hueco
+importe de verdad, la solución no es este archivo, es dejar de usar el
+plan gratis de Render para este proceso.

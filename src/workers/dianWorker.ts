@@ -1,4 +1,5 @@
 import "dotenv/config";
+import express from "express";
 import { Worker, Job } from "bullmq";
 import mongoose from "mongoose";
 import { connection } from "../config/redis";
@@ -7,6 +8,23 @@ import { DIAN_QUEUE_NAME, DianJobData } from "../queues/dianQueue";
 import { Sale } from "../models/Sale";
 import { dianService } from "../services/dianService";
 import { reconcilePendingDianSales } from "../jobs/reconcilePendingDianSales";
+
+// Servidor HTTP mínimo, solo para que Render acepte este proceso como Web
+// Service en el plan gratis (que exige un puerto abierto; un Background
+// Worker real requiere plan pago) — ver punto 66 de backend/CLAUDE.md para
+// el detalle completo y los riesgos aceptados de este approach. No agrega
+// `cors`: este endpoint solo lo golpea un monitor externo (UptimeRobot), no
+// un navegador, mismo criterio que `GET /health` del API (punto 58).
+function startHealthServer() {
+  const app = express();
+  app.get("/health", (_req, res) => {
+    res.status(200).json({ status: "ok", service: "mecatos-dian-worker", uptime: process.uptime() });
+  });
+  const port = Number(process.env.PORT) || 3000;
+  app.listen(port, () => {
+    console.log(`[DianWorker] Health check escuchando en :${port}`);
+  });
+}
 
 async function processJob(job: Job<DianJobData>) {
   const sale = await Sale.findById(job.data.saleId);
@@ -37,6 +55,7 @@ async function processJob(job: Job<DianJobData>) {
 }
 
 async function main() {
+  startHealthServer();
   await connectDB();
 
   const worker = new Worker<DianJobData>(DIAN_QUEUE_NAME, processJob, {

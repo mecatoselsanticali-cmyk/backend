@@ -205,7 +205,28 @@ export async function listProducts(req: Request, res: Response) {
   const { category, search, includeInactive, branchId } = req.query;
   const filter: any = {};
   if (category) filter.category = category;
-  if (search) filter.$text = { $search: String(search) };
+  // Antes usaba `$text` sobre el índice de texto de Product (name+sku) —
+  // bug real encontrado: $text hace un OR de palabras sueltas (no
+  // substring/frase), así que buscar el nombre completo de un producto
+  // (ej. "Arepa de Maiz") matcheaba cualquier otro producto que
+  // compartiera una sola palabra común ("de", "con", etc.) — y como el
+  // resultado se ordena por `category`/`name` (abajo), no por relevancia
+  // de texto, el producto que sí buscabas podía quedar fuera de la
+  // primera página entre todo ese ruido. Una búsqueda por SKU nunca lo
+  // mostraba porque un SKU es casi siempre único, sin ese ruido. Corregido
+  // al mismo patrón de regex escapado + case-insensitive que ya usan
+  // `listUsers`/`listBranches` — substring real sobre `name` O `sku`, sin
+  // sorpresas de coincidencia parcial por palabra.
+  if (search) {
+    const term = String(search).trim();
+    if (term) {
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$or = [
+        { name: { $regex: escaped, $options: "i" } },
+        { sku: { $regex: escaped, $options: "i" } },
+      ];
+    }
+  }
   if (includeInactive !== "true") filter.active = true;
 
   // Si viene `branchId` (selector de sede en Inventario, o el modal de

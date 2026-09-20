@@ -24,7 +24,14 @@ export const PAYMENT_METHOD_GROUP: Record<PaymentMethod, PaymentMethodGroup> = {
   BANCOLOMBIA: "BANCOLOMBIA_GROUP",
 };
 export type PaymentStatus = "COMPLETED" | "PENDING_PAYMENT";
-export type DianStatus = "PENDING" | "SENT" | "APPROVED" | "REJECTED";
+// "NOT_EMITTED" es el estado terminal de una venta `category: "REGULAR"` —
+// nunca hubo (ni habrá) un intento de emisión para ella, así que dejarla en
+// "PENDING" para siempre sería engañoso (sugiere que algo todavía la va a
+// procesar). Ver punto 37 de backend/CLAUDE.md: el invariante es
+// `category === "REGULAR"` ⟺ `dianStatus === "NOT_EMITTED"`, sin importar
+// si la venta nació REGULAR o cayó a REGULAR tras un intento fallido del
+// Disparador 2.
+export type DianStatus = "PENDING" | "SENT" | "APPROVED" | "REJECTED" | "NOT_EMITTED";
 export type InvoiceType = "POS_DOC" | "FACTURA_NOMINAL";
 export type SaleStatus = "ACTIVE" | "CANCELLED";
 // Etiqueta manual, elegida por quien registra la venta (no calculada a
@@ -148,7 +155,7 @@ const SaleSchema = new Schema<ISale>(
     },
     dianStatus: {
       type: String,
-      enum: ["PENDING", "SENT", "APPROVED", "REJECTED"],
+      enum: ["PENDING", "SENT", "APPROVED", "REJECTED", "NOT_EMITTED"],
       default: "PENDING",
       index: true,
     },

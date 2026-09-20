@@ -10,6 +10,7 @@ import { enqueueSaleForDianEmission } from "../queues/dianQueue";
 import { logSaleToSheets, logExpenseToSheets, logStockLossToSheets, syncInventoryToSheets } from "../utils/sheetsSync";
 import { getCashierShiftStart } from "../utils/shiftRange";
 import { getStartOfTodayColombia } from "../utils/dateRange";
+import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
 import { Types } from "mongoose";
 
 /**
@@ -106,8 +107,8 @@ export async function createSale(req: Request, res: Response) {
     offlineCreated,
     localTicketId,
   } = req.body;
-  const THIRTY_MINUTES = Number(process.env.THIRTY_MINUTES);
-  const MAX_GROUP_1 = Number(process.env.MAX_GROUP_1);
+  const THIRTY_MINUTES = getThirtyMinutesMs();
+  const MAX_GROUP_1 = getMaxGroup1();
   let category: string = "REGULAR";
   let hasSpace: boolean = false;
   let thirtyMinutesPassed: boolean = false;
@@ -177,20 +178,40 @@ export async function createSale(req: Request, res: Response) {
     return res.status(400).json({ error: "Sede no encontrada" });
   }
   
-  if (branchInfo.dianResponsible === true) {
+  // Dos disparadores legales independientes para la emisión DIAN (ver punto
+  // 37 de CLAUDE.md, reescrito): (1) el cliente pide factura electrónica
+  // explícitamente — el cajero le pregunta antes de cobrar
+  // (InvoicePromptModal.tsx) y, si acepta, captura sus datos con
+  // CustomerModal; `customer.document` presente ya es señal suficiente, no
+  // hace falta un flag aparte en el payload — y (2) la venta cae dentro del
+  // tope/cooldown diario de "Grupo 1" ya existente. Cada uno decide
+  // `category`/la emisión por su cuenta, sin mezclarse entre sí.
+  const wantsNominalInvoice = Boolean(customer?.document);
+
+  if (wantsNominalInvoice) {
+    // Disparador 1: sin tope ni cooldown de por medio — un cliente que pide
+    // factura la recibe siempre que la sede sea responsable de declarar.
+    category = branchInfo.dianResponsible === true ? "SPECIAL" : "REGULAR";
+  } else if (branchInfo.dianResponsible === true) {
+    // Disparador 2: la venta pasa a "Grupo 1" según el tope diario/cooldown
+    // ya existentes — el filtro `invoiceType: "POS_DOC"` excluye a propósito
+    // las ventas del disparador 1 de este cálculo, para que una mañana
+    // ocupada de facturas pedidas por clientes no le coma cupo/cooldown al
+    // disparador automático (son dos cupos independientes).
     const now = Date.now();
-  
+
     // COLOMBIA_TIME_ZONE/COLOMBIA_UTC_OFFSET vienen de utils/dateRange.ts —
     // antes se redeclaraban acá mismo (duplicado de las mismas constantes),
     // ahora reutilizan el único punto de verdad del backend.
     const startOfTodayColombia = getStartOfTodayColombia();
-  
+
     const lastGroup1Item = await Sale.findOne({
       branchId: posSession.branchId,
       category: "SPECIAL",
+      invoiceType: "POS_DOC",
       createdAt: { $gte: startOfTodayColombia },
     }).sort({ createdAt: -1 });
-  
+
     // `$match` en un pipeline de agregación NO castea tipos como sí lo
     // hace Model.find()/findOne() — comparar el string `branchId` contra
     // el ObjectId real guardado en Mongo no matchea nada (mismo gotcha ya
@@ -201,33 +222,24 @@ export async function createSale(req: Request, res: Response) {
         $match: {
           branchId: new Types.ObjectId(posSession.branchId),
           category: "SPECIAL",
+          invoiceType: "POS_DOC",
           createdAt: { $gte: startOfTodayColombia },
         },
       },
       { $group: { _id: null, total: { $sum: "$total" } } },
     ]);
-  
+
     const group1Total = group1SumResult.length ? group1SumResult[0].total : 0;
     const newTotal = Number(group1Total) + Number(total);
-  
+
     hasSpace = newTotal < MAX_GROUP_1;
-        
-  
+
     thirtyMinutesPassed =
       !lastGroup1Item ||
       now - lastGroup1Item.createdAt.getTime() >= THIRTY_MINUTES;
-  
+
     category = hasSpace && thirtyMinutesPassed ? "SPECIAL" : "REGULAR";
   }
-
-  // Factura Electrónica Nominal también aplica cuando el CLIENTE la pide
-  // voluntariamente (aunque la venta no supere el tope) — el cajero le
-  // pregunta antes de cobrar (InvoicePromptModal.tsx) y, si acepta, captura
-  // sus datos con el mismo CustomerModal que ya exige el tope. `customer`
-  // solo llega poblado en ese caso (o en el caso obligatorio de arriba), así
-  // que su sola presencia con `document` ya es señal suficiente — no hace
-  // falta un flag aparte en el payload.
-  const wantsNominalInvoice = Boolean(customer?.document);
 
   // Crea la venta ANTES de descontar stock (mismo razonamiento que
   // createSaleAdmin): si el descuento fallara a mitad de camino, es
@@ -247,7 +259,10 @@ export async function createSale(req: Request, res: Response) {
     total,
     customer,
     invoiceType: wantsNominalInvoice ? "FACTURA_NOMINAL" : "POS_DOC",
-    dianStatus: "PENDING",
+    // Una venta "REGULAR" nunca va a intentar emitirse — dejarla en
+    // "PENDING" sería engañoso (sugiere que algo la va a procesar después,
+    // y nada lo hará). Ver punto 37 de CLAUDE.md.
+    dianStatus: category === "REGULAR" ? "NOT_EMITTED" : "PENDING",
     offlineCreated: Boolean(offlineCreated),
     localTicketId,
     stockDecremented: true,
@@ -263,17 +278,47 @@ export async function createSale(req: Request, res: Response) {
     );
   }
 
-  // Emisión 100% en segundo plano (REQ-02).
-  // Se envuelve en try/catch: si Redis falla al encolar, la venta ya quedó
-  // guardada en Mongo y de todas formas respondemos al cajero. La venta
-  // simplemente queda dianStatus=PENDING hasta que se reintente el encolado
-  // (ver nota más abajo sobre reconciliación).
-  if(branchInfo.dianResponsible === true && hasSpace && thirtyMinutesPassed){
+  // Disparador 1 (cliente pidió factura) sigue el camino async de siempre —
+  // encolar y responder de inmediato, con reintentos + reconciliación de
+  // fondo (ver punto 2/3 de CLAUDE.md) — porque hay un cliente puntual
+  // esperando ESE documento, no otra venta que pueda cubrir el requisito en
+  // su lugar.
+  if (wantsNominalInvoice && category === "SPECIAL") {
     try {
       await enqueueSaleForDianEmission(String(sale._id));
     } catch (err) {
       console.error(`[createSale] No se pudo encolar la venta ${sale._id} para DIAN:`, err);
     }
+  } else if (!wantsNominalInvoice && category === "SPECIAL") {
+    // Disparador 2 (tope/cooldown diario): un solo intento inline, síncrono
+    // con la respuesta — a diferencia del disparador 1, si este falla no
+    // hace falta reintentar: otra venta más tarde en el mismo día puede
+    // cubrir el mismo requisito de "Grupo 1", así que se deja caer a
+    // REGULAR en vez de encolar (ver punto 37 de CLAUDE.md).
+    try {
+      const result = await dianService.emit(sale);
+      if (result.status === "APPROVED") {
+        sale.dianStatus = "APPROVED";
+        sale.cufe = result.cufe;
+        sale.qrCodeUrl = result.qrCodeUrl;
+        sale.dianInvoiceNumber = result.invoiceNumber;
+      } else {
+        // "REJECTED", no "NOT_EMITTED" — esta venta SÍ se intentó emitir
+        // (a diferencia de una que nunca calificó para el Disparador 2 y
+        // nace "NOT_EMITTED" directo, ver más arriba), así que queda
+        // marcada para revisión manual como cualquier otro rechazo (punto
+        // 3) — el fallo pudo haber llegado a tocar la API de Siigo antes
+        // de fallar, vale la pena poder rastrearla en vez de perderla entre
+        // las que nunca se intentaron.
+        sale.dianStatus = "REJECTED";
+        sale.category = "REGULAR";
+      }
+    } catch (err) {
+      console.error(`[createSale] Emisión inline fallida para la venta ${sale._id}:`, err);
+      sale.dianStatus = "REJECTED";
+      sale.category = "REGULAR";
+    }
+    await sale.save();
   }
 
   logSaleToSheets(sale).catch((err) => {

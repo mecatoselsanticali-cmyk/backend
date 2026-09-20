@@ -31,6 +31,7 @@ import {
   getStartOfTodayColombia,
   COLOMBIA_TIME_ZONE,
 } from "../utils/dateRange";
+import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
 import { sendWelcomeEmail } from "../utils/mailerResend";
 import { generateResetToken } from "../utils/passwordResetToken";
 
@@ -1200,8 +1201,8 @@ export async function listSaleUsers(req: Request, res: Response) {
 export async function createSaleAdmin(req: Request, res: Response) {
   const { items, paymentMethod, customer } = req.body;
   let { branchId } = req.body;
-  const THIRTY_MINUTES = Number(process.env.THIRTY_MINUTES);
-  const MAX_GROUP_1 = Number(process.env.MAX_GROUP_1);
+  const THIRTY_MINUTES = getThirtyMinutesMs();
+  const MAX_GROUP_1 = getMaxGroup1();
   let category: string = "REGULAR";
   let hasSpace: boolean = false;
   let thirtyMinutesPassed: boolean = false;
@@ -1299,7 +1300,21 @@ export async function createSaleAdmin(req: Request, res: Response) {
     return res.status(400).json({ error: "Sede no encontrada" });
   }
 
-  if (branchInfo.dianResponsible === true) {
+  // Dos disparadores legales independientes para la emisión DIAN (ver punto
+  // 37 de CLAUDE.md, reescrito): (1) el admin incluye los datos del cliente
+  // al registrar la venta — eso por sí solo indica que pidió factura
+  // electrónica, sin tope ni cooldown de por medio — y (2) la venta cae
+  // dentro del tope/cooldown diario de "Grupo 1" ya existente. Cada uno
+  // decide `category`/la emisión por su cuenta, sin mezclarse entre sí.
+  const wantsNominalInvoice = Boolean(customer?.document);
+
+  if (wantsNominalInvoice) {
+    category = branchInfo.dianResponsible === true ? "SPECIAL" : "REGULAR";
+  } else if (branchInfo.dianResponsible === true) {
+      // El filtro `invoiceType: "POS_DOC"` excluye a propósito las ventas
+      // del disparador 1 de este cálculo — dos cupos independientes, una
+      // mañana ocupada de facturas pedidas por clientes no le come
+      // cupo/cooldown al disparador automático.
       const now = Date.now();
 
       // COLOMBIA_TIME_ZONE/COLOMBIA_UTC_OFFSET vienen de utils/dateRange.ts —
@@ -1310,6 +1325,7 @@ export async function createSaleAdmin(req: Request, res: Response) {
       const lastGroup1Item = await Sale.findOne({
           branchId,
           category: "SPECIAL",
+          invoiceType: "POS_DOC",
           createdAt: { $gte: startOfTodayColombia },
         }).sort({ createdAt: -1 });
 
@@ -1323,6 +1339,7 @@ export async function createSaleAdmin(req: Request, res: Response) {
             $match: {
               branchId: new Types.ObjectId(branchId),
               category: "SPECIAL",
+              invoiceType: "POS_DOC",
               createdAt: { $gte: startOfTodayColombia },
             },
           },
@@ -1333,7 +1350,6 @@ export async function createSaleAdmin(req: Request, res: Response) {
       const newTotal = Number(group1Total) + Number(total);
 
       hasSpace = newTotal < MAX_GROUP_1;
-      
 
       thirtyMinutesPassed =
         !lastGroup1Item ||
@@ -1359,9 +1375,11 @@ export async function createSaleAdmin(req: Request, res: Response) {
     tax,
     total,
     customer,
-    invoiceType: "POS_DOC",
-    //invoiceType: requiresNominal ? "FACTURA_NOMINAL" : "POS_DOC",
-    dianStatus: "PENDING",
+    invoiceType: wantsNominalInvoice ? "FACTURA_NOMINAL" : "POS_DOC",
+    // Una venta "REGULAR" nunca va a intentar emitirse — dejarla en
+    // "PENDING" sería engañoso (sugiere que algo la va a procesar después,
+    // y nada lo hará). Ver punto 37 de CLAUDE.md.
+    dianStatus: category === "REGULAR" ? "NOT_EMITTED" : "PENDING",
     offlineCreated: false,
     stockDecremented: true,
     category,
@@ -1388,13 +1406,43 @@ export async function createSaleAdmin(req: Request, res: Response) {
   // (`reconcilePendingDianSales.ts`) igual reencola cualquier venta que
   // quede `dianStatus: PENDING` sin job vivo, así que perder este enqueue
   // puntual no deja una venta huérfana.
-  if(branchInfo.dianResponsible === true && hasSpace && thirtyMinutesPassed){
-    console.log("enviando venta como especial")
+  if (wantsNominalInvoice && category === "SPECIAL") {
     enqueueSaleForDianEmission(String(sale._id)).catch((err) => {
       console.error(`[createSaleAdmin] No se pudo encolar la venta ${sale._id} para DIAN:`, err);
     });
+  } else if (!wantsNominalInvoice && category === "SPECIAL") {
+    // Disparador 2 (tope/cooldown diario): un solo intento inline, síncrono
+    // con la respuesta — si falla, cae a REGULAR en vez de encolar, porque
+    // otra venta más tarde en el mismo día puede cubrir el mismo requisito
+    // de "Grupo 1" (ver punto 37 de CLAUDE.md). A diferencia del enqueue de
+    // arriba, esto SÍ se espera — es la única forma de que `category`/
+    // `dianStatus` en la respuesta ya reflejen el resultado real.
+    try {
+      const result = await dianService.emit(sale);
+      if (result.status === "APPROVED") {
+        sale.dianStatus = "APPROVED";
+        sale.cufe = result.cufe;
+        sale.qrCodeUrl = result.qrCodeUrl;
+        sale.dianInvoiceNumber = result.invoiceNumber;
+      } else {
+        // "REJECTED", no "NOT_EMITTED" — esta venta SÍ se intentó emitir
+        // (a diferencia de una que nunca calificó para el Disparador 2 y
+        // nace "NOT_EMITTED" directo, ver más arriba), así que queda
+        // marcada para revisión manual como cualquier otro rechazo (punto
+        // 3) — el fallo pudo haber llegado a tocar la API de Siigo antes
+        // de fallar, vale la pena poder rastrearla en vez de perderla entre
+        // las que nunca se intentaron.
+        sale.dianStatus = "REJECTED";
+        sale.category = "REGULAR";
+      }
+    } catch (err) {
+      console.error(`[createSaleAdmin] Emisión inline fallida para la venta ${sale._id}:`, err);
+      sale.dianStatus = "REJECTED";
+      sale.category = "REGULAR";
+    }
+    await sale.save();
   }
-  
+
 
   // Igual que el enqueue de DIAN arriba: fire-and-forget, nunca bloquea la
   // respuesta (ver docs/GOOGLE_SHEETS_INTEGRATION.md y utils/sheetsSync.ts).

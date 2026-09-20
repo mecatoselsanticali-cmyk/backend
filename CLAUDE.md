@@ -24,11 +24,15 @@ petición se queda sin respuesta — el cliente (el POS) se cuelga en
 "Procesando..." indefinidamente. Esto ya pasó una vez en este proyecto; no lo
 repitas al agregar rutas nuevas.
 
-### 2. La emisión DIAN es 100% asíncrona vía BullMQ — nunca la llames inline
+### 2. La emisión DIAN — asíncrona vía BullMQ por defecto, pero ya NO exclusivamente
 
-`dianService.emit()` (mock hoy, PTA real después) **solo se llama desde
-`workers/dianWorker.ts`**, nunca directamente desde un controlador HTTP. El
-flujo correcto para cualquier venta nueva:
+**Corrección a este punto**: durante un tiempo esto decía "nunca la llames
+inline" a secas. Ya no es cierto — desde el punto 37 (reescrito), `category:
+"SPECIAL"` tiene dos disparadores distintos con distinto tratamiento:
+
+- **Disparador 1 (el cliente pidió factura electrónica)**: sigue el patrón
+  de siempre, sin cambios — `dianService.emit()` **solo se llama desde
+  `workers/dianWorker.ts`**, nunca desde el controlador:
 
 ```
 controlador → guarda Sale en Mongo (dianStatus: PENDING)
@@ -38,8 +42,18 @@ controlador → guarda Sale en Mongo (dianStatus: PENDING)
 worker → toma el job → dianService.emit() → actualiza Sale.dianStatus
 ```
 
+- **Disparador 2 (tope/cooldown diario de "Grupo 1", sin cliente de por
+  medio)**: `posController.createSale`/`adminController.createSaleAdmin`
+  **sí llaman a `dianService.emit()` directo, síncrono, antes de responder**
+  — un solo intento, sin reintentos, cae a `category: "REGULAR"` si falla.
+  Ver punto 37 para el razonamiento completo (por qué este disparador
+  específico puede permitirse fallar sin reintentar, y el otro no).
+
 Si agregas un nuevo flujo que genera ventas (ej. webhook de Rappi/DiDi),
-sigue este mismo patrón.
+sigue el patrón del Disparador 1 (encolar, nunca llamar `emit()` inline) —
+el Disparador 2 es una excepción deliberada y acotada a ese caso puntual del
+tope diario, no un precedente general para llamar `emit()` desde un
+controlador.
 
 ### 3. Job de reconciliación — no lo dupliques ni lo borres sin más
 
@@ -823,50 +837,154 @@ puramente de la zona de cajero — ver ese archivo para el detalle.
 `syncOfflineSales` y `adminController.createSaleAdmin` no se tocaron para
 esto (ver esa entrada para el porqué).
 
-### 37. `createSaleAdmin` categoriza `SPECIAL`/`REGULAR` según un tope diario — solo si la sede es `dianResponsible`
+### 37. `category: "SPECIAL"` tiene DOS disparadores independientes — cliente que pide factura, y tope/cooldown diario de "Grupo 1"
 
-Lógica exclusiva de `POST /api/admin/sales` (no existe en
-`posController.createSale`, el flujo del cajero): `MAX_GROUP_1 = 509000`
-y `THIRTY_MINUTES = 2 * 60 * 1000` son constantes locales de
-`createSaleAdmin`, no importadas de `dianService` — si el negocio quiere
-que el tope se mantenga igual al `DIAN_TOPE_CONSUMIDOR_FINAL` de
-`dianService.requiresNominalInvoice` (punto 35), hay que actualizar
-ambas a mano, no están enlazadas.
+**Reescrito por completo** — la versión anterior de este punto describía
+solo el disparador de tope diario, y decía que esta lógica era exclusiva
+de `createSaleAdmin`; eso ya era falso antes de esta reescritura
+(`posController.createSale` siempre tuvo el mismo bloque duplicado, no
+importado entre los dos — mismo patrón de duplicación intencional que el
+resto del proyecto entre admin y cajero). Ahora además hay un segundo
+disparador real, confirmado con el contador del negocio: la ley NO exige
+timbrar todas las ventas, exige timbrar (1) las que el cliente pide
+explícitamente, y (2) un grupo adicional gatiado por volumen diario — son
+dos requisitos independientes, no una sola regla.
 
-- **Todo el bloque solo corre si `branchInfo.dianResponsible === true`**
-  (el checkbox "Responsable de declarar ante la DIAN" de
-  `BranchModal.tsx`, ver `Branch.ts`). Si la sede NO es `dianResponsible`,
-  la venta siempre queda `category: "REGULAR"` y **nunca se encola para
-  emisión DIAN** — el segundo `if` (justo antes de
-  `enqueueSaleForDianEmission`) también exige
-  `branchInfo.dianResponsible === true`. **Esto contradice el comentario
-  actual en `Branch.ts`** (`"dato informativo, no gatea la emisión"`) —
-  ese comentario quedó desactualizado: el campo empezó como
-  puramente informativo pero el código de acá ya lo usa para gatear tanto
-  la categorización como el encolado real a DIAN. Si tocas cualquiera de
-  los dos lados, actualiza el otro para que no queden contradictorios.
-- Cuando sí aplica: suma el total de ventas `category: "SPECIAL"` de HOY
-  (hora Bogotá, `getStartOfTodayColombia()`) en esa sede vía
-  `Sale.aggregate` — con `branchId` casteado a mano a `ObjectId` en el
-  `$match` (mismo gotcha de `getDashboardMetrics`: `$match` no castea
-  como sí lo hace `Model.find()`) — y calcula `hasSpace = (sumaHoy +
-  total) < MAX_GROUP_1`. También exige `thirtyMinutesPassed` desde la
-  última venta `SPECIAL` de esa sede (`Sale.findOne`, mismo scope por
-  `branchId`). Solo si **ambas** son ciertas, `category = "SPECIAL"` —
-  si no, `"REGULAR"`. La venta se crea siempre, con `category` ya
-  decidido; `invoiceType` queda hardcodeado a `"POS_DOC"` sin relación
-  con esto (el bloque que lo decidía según `requiresNominal` está
-  comentado/deshabilitado, ver punto 19 en `admin-frontend/CLAUDE.md`).
-- **Bug real pendiente, no corregido a propósito sin que se pida**:
-  `THIRTY_MINUTES = 2 * 60 * 1000` son **2 minutos**, no 30, pese al
-  nombre de la constante. Si el negocio de verdad quiere un cooldown de
-  30 minutos entre ventas `SPECIAL`, hay que cambiarlo a `30 * 60 *
-  1000`.
-- El `hasSpace && thirtyMinutesPassed` que gatea el `enqueueSaleForDianEmission`
-  ya implica `dianResponsible === true` (esas dos variables solo pueden
-  ser `true` si el bloque de arriba corrió) — repetir
-  `branchInfo.dianResponsible === true` en ese segundo `if` no cambia el
-  comportamiento, es solo una condición explícita/defensiva, no un bug.
+`MAX_GROUP_1`/`THIRTY_MINUTES` se leen vía `getMaxGroup1()`/
+`getThirtyMinutesMs()` (`backend/src/utils/dianThresholds.ts`, nuevo) —
+mismo valor esperado en ambos controladores, sin estar enlazado al
+`DIAN_TOPE_CONSUMIDOR_FINAL` de `dianService.requiresNominalInvoice`
+(punto 35), que es un concepto distinto (tope de consumidor final para
+exigir datos del comprador, no el tope de "Grupo 1").
+
+**Bug real en producción, encontrado y corregido — `THIRTY_MINUTES=30 *
+60 * 1000` en `.env` rompía el cooldown en silencio.** Antes, ambos
+controladores leían estas dos variables con un `Number(process.env.X)`
+directo, sin fallback. Un `.env` no evalúa expresiones — ese valor se
+cargaba como el STRING literal `"30 * 60 * 1000"`, y `Number(...)` de eso
+da `NaN`. Cualquier comparación contra `NaN` es siempre `false`, así que
+`thirtyMinutesPassed` quedaba permanentemente `false` apenas existía una
+venta `SPECIAL` ese día — sin importar cuánto tiempo real pasara después,
+sin ningún error en ningún log. Se detectó porque una venta real no caía
+en `SPECIAL` más de 30 minutos después de la última, sin motivo aparente.
+`getThirtyMinutesMs()`/`getMaxGroup1()` reemplazan el `Number(...)` inline
+por un parseo seguro: si el valor falta, está vacío, o no es un número
+real, cae a un default conocido-bueno (`1800000`/`509000`) **y** lo avisa
+con `console.warn` — en vez de fallar silenciosamente otra vez. Si agregas
+otra variable de entorno numérica que alimente una condición de negocio
+como esta, sigue este mismo patrón (parseo con fallback + warning fuerte),
+no un `Number(process.env.X)` desnudo.
+
+**Disparador 1 — el cliente pide factura electrónica**
+(`wantsNominalInvoice = Boolean(customer?.document)`, mismo criterio ya
+usado en el punto 35 del lado del cajero): si es verdadero, `category`
+se decide SOLO por si la sede es `dianResponsible` — sin tope ni cooldown
+de por medio. Un cliente que pide factura la recibe siempre que la sede
+pueda declarar. Este disparador se encola por el camino async de siempre
+(`enqueueSaleForDianEmission`, ver punto 2) — un cliente puntual está
+esperando ESE documento, así que conserva los 5 reintentos con backoff +
+la reconciliación de fondo.
+
+**Disparador 2 — tope/cooldown diario de "Grupo 1"** (sin cliente de por
+medio, `wantsNominalInvoice === false`): solo corre si
+`branchInfo.dianResponsible === true`. Suma el total de ventas de HOY
+(hora Bogotá, `getStartOfTodayColombia()`) con `category: "SPECIAL"` **Y
+`invoiceType: "POS_DOC"`** en esa sede vía `Sale.aggregate` — el filtro
+`invoiceType: "POS_DOC"` es lo que mantiene este cupo independiente del
+Disparador 1 (**decisión explícita, confirmada antes de implementar**: una
+mañana ocupada de facturas pedidas por clientes no debe comerle cupo ni
+reiniciar el cooldown al disparador automático) — con `branchId` casteado
+a mano a `ObjectId` en el `$match` (mismo gotcha de `getDashboardMetrics`:
+`$match` no castea como sí lo hace `Model.find()`) — y calcula `hasSpace =
+(sumaHoy + total) < MAX_GROUP_1`. También exige `thirtyMinutesPassed`
+desde la última venta `SPECIAL`/`POS_DOC` de esa sede (`Sale.findOne`,
+mismo scope + mismo filtro de `invoiceType`). Solo si **ambas** son
+ciertas, `category = "SPECIAL"` — si no, `"REGULAR"`.
+
+**Si el Disparador 2 queda `category: "SPECIAL"`, la venta intenta
+emitirse EN LÍNEA, no se encola** — `dianService.emit(sale)` se llama
+directo desde el controlador, `await`ado antes de responder (ver la
+excepción documentada en el punto 2). Es un solo intento, sin reintentos:
+- Si `result.status === "APPROVED"`: `sale.dianStatus`/`cufe`/
+  `qrCodeUrl`/`dianInvoiceNumber` se actualizan con el resultado real antes
+  de guardar — la respuesta HTTP ya trae el resultado final, no queda
+  `PENDING`.
+- Si `result.status === "REJECTED"`, o la llamada lanza una excepción
+  (network, Siigo caído, config faltante): `sale.category` se baja a
+  `"REGULAR"` y `sale.dianStatus = "REJECTED"` — **decisión explícita, no
+  un descuido**: a diferencia del Disparador 1, acá no hace falta
+  reintentar — otra venta más tarde el mismo día puede cubrir el mismo
+  cupo de "Grupo 1", así que perder este intento puntual no dice nada
+  sobre si el requisito diario se cumple o no. Al bajar a `REGULAR`
+  (dejando de contar en el `$match` de arriba, gracias al filtro por
+  `category`), libera el cupo/cooldown para que una venta futura sí pueda
+  calificar.
+
+**Costo real de este diseño — la respuesta de `createSale`/
+`createSaleAdmin` puede tardar más de lo normal**: el peor caso de Siigo
+(auth + POST + hasta 5 sondeos de 2s por el CUFE) puede acercarse o
+superar los 8s. Los clientes axios (`posHttp`/`adminHttp`,
+`admin-frontend`) tienen ese mismo timeout de 8s por default — por eso
+`posApi.createSale`/`adminApi.createSale` mandan un `timeout: 20000`
+explícito solo en esta llamada, en vez de subir el default global (que
+sigue protegiendo al resto de las peticiones de quedarse colgadas de
+verdad). En el cajero, `PaymentPanel.tsx` distingue los dos disparadores
+mirando `dianStatus` en la respuesta, no `category` a secas: `category
+=== "SPECIAL" && dianStatus === "PENDING"` (Disparador 1, todavía
+encolado) muestra `EmittingReceipt.tsx` y hace polling de `GET
+/api/pos/sales/:id/status`; cualquier otro caso (`REGULAR`, o `SPECIAL`
+ya resuelto por el Disparador 2) va directo al recibo real, porque no hay
+nada más que esperar.
+
+**El panel admin (`SaleModal.tsx`) NO tiene el mismo polling** — a
+propósito, decisión explícita: un admin registrando una venta no es una
+fila de caja en vivo como el cajero, así que el recibo sigue mostrando el
+texto estático "Factura electrónica en proceso de validación DIAN" para
+una venta que quedó `PENDING` (Disparador 1) hasta que se refresque/
+reabra — no hay un `EmittingReceipt` equivalente ahí. Si esto cambia
+algún día, hay que construir esa UI desde cero, no asumir que ya existe.
+
+**`dianStatus: "NOT_EMITTED"` (nuevo valor del enum, `Sale.ts`) — el
+estado de una venta `category: "REGULAR"` que NUNCA se intentó emitir.**
+Antes, se quedaba con el default `dianStatus: "PENDING"` para siempre —
+engañoso, porque nada la iba a procesar (ni el worker, ni la
+reconciliación, que ya filtra por `category: "SPECIAL"`, ver punto 3). A
+diferencia de una primera versión de este punto, **`NOT_EMITTED` y
+`REJECTED` NO son intercambiables** — corregido explícitamente después de
+notar que fundía dos situaciones distintas en una sola:
+- **`NOT_EMITTED`**: la venta nace `category: "REGULAR"` sin que
+  `dianService.emit()` se haya llamado en absoluto — sede no
+  `dianResponsible`, o no pasó el tope/cooldown del Disparador 2. Al
+  crear la venta: `dianStatus: category === "REGULAR" ? "NOT_EMITTED" :
+  "PENDING"` en vez de `"PENDING"` fijo.
+- **`REJECTED`**: la venta SÍ se intentó emitir y falló — cubre tanto al
+  Disparador 1 (`category: "SPECIAL"`, agotó los 5 reintentos del worker)
+  como al intento en línea del Disparador 2 que falla (`category` baja a
+  `"REGULAR"`, pero `dianStatus` queda `"REJECTED"`, no `"NOT_EMITTED"`).
+  **Motivo explícito de no fundirlos**: un intento fallido pudo haber
+  llegado a tocar la API real de Siigo antes de fallar (ej. la conexión se
+  cae justo después del `POST /v1/invoices` pero antes de leer la
+  respuesta) — vale la pena poder rastrear esas ventas contra el
+  dashboard de Siigo en vez de perderlas mezcladas con las que nunca se
+  intentaron. Sigue quedando para revisión manual, sin reintento
+  automático (punto 3) — nada de esto cambió, solo a qué `category` le
+  correspondía.
+
+Con esto, `category: "REGULAR"` puede terminar con `dianStatus`
+`"NOT_EMITTED"` **o** `"REJECTED"` según si hubo intento — ya no es un
+invariante 1:1 tan simple como "REGULAR siempre es NOT_EMITTED". Si tocas
+este flujo de nuevo, no asumas esa equivalencia.
+
+**Frontend**: `Ventas.tsx` (`statusColors` + los 2 `<select>` de filtro,
+desktop y `MoreFiltersModal`) y `cajero/pages/Facturas.tsx`
+(`statusLabels`) ganaron una entrada para `NOT_EMITTED` — gris neutro
+(`bg-neutral-100 text-neutral-500`), etiqueta "No emitida"/"No aplica". Sin
+esto, `Facturas.tsx` en particular caía al fallback `statusLabels.PENDING`
+para CUALQUIER venta REGULAR (la mayoría del catálogo) y las mostraba
+todas como "Pendiente" en ámbar — mismo problema engañoso que motivó este
+punto, del lado del cajero. Si agregas otro consumidor de `dianStatus`
+(otra tabla, otro badge), acuérdate de mapear este valor también — no
+asumas que el enum sigue siendo solo los 4 de siempre.
 
 ### 38. Gastos: editar/eliminar es un borrado real, sin reversar nada — a propósito distinto de Sale/Purchase
 

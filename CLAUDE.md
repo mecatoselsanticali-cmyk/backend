@@ -128,6 +128,15 @@ verificado en el JSDoc del `worker-options.d.ts` instalado) y
 `drainDelay` alto NO retrasa la recogida real de un job nuevo — BullMQ v5
 despierta al worker casi al instante con un "marker" en cuanto se encola
 algo; ese valor solo espacia la reconexión cuando no hay nada que hacer.
+**Verificado en el código instalado (`bullmq` 5.81.3,
+`classes/worker.js` → `getBlockTimeout`)**: el tope de 10s
+(`maximumBlockTimeout`) solo aplica mientras exista un job *delayed* (ej.
+uno en backoff de reintento); sin jobs delayed, el bloqueo ocioso es
+`max(drainDelay, mínimo)`, o sea los 60s completos. Ningún otro timer del
+`Worker` (renovación de lock, `runRetryDelay`, `maximumRateLimitDelay`)
+corre en ocio — solo con un job activo o fallando — así que `drainDelay` y
+`stalledInterval` son las únicas dos perillas que gobiernan el tráfico
+ocioso, y subir `drainDelay` más allá de 60 ahorra muy poco.
 `stalledInterval` alto es seguro acá porque `reconcilePendingDianSales`
 (punto 3, cada 5 min) ya hace la misma recuperación a nivel de Mongo — el
 chequeo nativo queda como capa secundaria. **No se midió el ahorro exacto
@@ -137,6 +146,32 @@ esto, y si sigue alto, el siguiente paso más agresivo es
 solo la reconciliación) o migrar a un plan fijo de Upstash sin cobro por
 comando. Si agregas otro `Worker`/`QueueEvents` (ej. el de Sheets, punto
 21), ten en cuenta que cada uno suma su propio consumo ocioso de este tipo.
+
+**`DISABLE_SHEETS_QUEUE=true` mientras no haya worker de Sheets.** La
+cola `sheets-sync` se llena en CADA venta, compra, gasto, cierre de caja y
+cambio de stock (por ítem) — `enqueueSheetsSync` (`queues/sheetsQueue.ts`)
+encola sin mirar si hay alguien consumiendo. Sin worker, esos jobs quedan
+en `waiting` para siempre (se midieron 35 acumulados en el Upstash
+anterior) y suman comandos y almacenamiento sin ningún beneficio. Con
+`DISABLE_SHEETS_QUEUE=true` esa función retorna antes del `.add()` — no
+toca Redis. Está puesto en `backend/.env` y **también hay que ponerlo en
+las variables del servicio del API en Render** (el `.env` local no viaja al
+despliegue). Cuando se despliegue el worker de Sheets, ponerlo en `false`
+o quitarlo — y recordar que ese worker sumará su propio consumo ocioso
+(mismo `drainDelay`/`stalledInterval` altos recomendados). Ojo: los
+helpers de `utils/sheetsSync.ts` igual hacen sus consultas a Mongo
+(Branch/User/Product/ProductStock) ANTES de llamar a `enqueueSheetsSync`,
+así que con el flag activo se siguen gastando esas lecturas por venta —
+no consumen Redis, solo Mongo.
+
+**Línea base de tráfico ocioso (pendiente de confirmar):** con los valores
+de arriba, el Upstash nuevo registró 166 comandos en 30 min (~8k/día,
+vs. 60k-144k/día antes). Muestra corta — verificar el "Usage" diario de
+Upstash tras 1-2 días. El desglose por comando/cliente (`INFO
+commandstats`/`CLIENT LIST`) no se pudo obtener desde la sesión de
+desarrollo (el host de la URL pegada no resolvía en DNS, probablemente esa
+instancia ya se reemplazó) — si hace falta, correr esa consulta de solo
+lectura con el `REDIS_URL` vigente.
 
 ### 5. El worker DIAN es un proceso separado del API — siempre
 
@@ -649,7 +684,10 @@ acción) — acá solo el resumen de arquitectura para no repetirlo:
   (punto 2): un fallo acá nunca debe afectar la operación real.
 - **`GOOGLE_SHEETS_WEBHOOK_URL`** (la URL `/exec` del Apps Script
   desplegado) solo hace falta en el proceso del **worker**, no en el API —
-  el API solo encola.
+  el API solo encola. **Mientras el worker de Sheets no esté desplegado,
+  el API debe correr con `DISABLE_SHEETS_QUEUE=true`** — si no, los jobs
+  se acumulan sin consumir y gastan Redis/Upstash (ver el final del
+  punto 4).
 - Reintentos con backoff exponencial (5 intentos, igual que DIAN) — Apps
   Script bound a un Spreadsheet tiene límites reales de concurrencia
   (`SpreadsheetApp` serializa escrituras simultáneas), así que un job

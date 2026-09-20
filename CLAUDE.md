@@ -109,6 +109,35 @@ aunque la app lleve rato "funcionando". Si ves este patrón exacto
 (reconecta sin parar, cero comandos según el proveedor, nada se encola),
 revisa el esquema de `REDIS_URL` antes que cualquier otra cosa.
 
+**Gotcha real de costos en Upstash — un `Worker` de BullMQ consume
+comandos aunque NO haya ni un solo job.** Reportado con el proyecto ya
+desplegado y sin ninguna venta creada ese día: Upstash mostraba ~60k
+comandos un día y ~144k al siguiente. No es un bug de la app — un `Worker`
+de BullMQ nunca está realmente ocioso contra Redis: reconecta su llamada
+bloqueante cada `drainDelay` (default 5s) y revisa jobs "stalled" cada
+`stalledInterval` (default 30s), lo que da ~1-1.5 comandos/segundo sin
+parar (~86k-130k/día) — justo lo que se vio. Y como el worker se mantiene
+despierto 24/7 a propósito (UptimeRobot, ver punto 67), ese consumo es
+continuo. Desde el split de disparadores del punto 37, esta cola solo la
+usa el Disparador 1 (poco frecuente), así que el consumo ocioso dominaba
+casi por completo el uso real de Redis.
+
+`dianWorker.ts` ahora pasa `drainDelay: 60` (**segundos**, no ms —
+verificado en el JSDoc del `worker-options.d.ts` instalado) y
+`stalledInterval: 300000` (**milisegundos**, 5 min) al `new Worker(...)`.
+`drainDelay` alto NO retrasa la recogida real de un job nuevo — BullMQ v5
+despierta al worker casi al instante con un "marker" en cuanto se encola
+algo; ese valor solo espacia la reconexión cuando no hay nada que hacer.
+`stalledInterval` alto es seguro acá porque `reconcilePendingDianSales`
+(punto 3, cada 5 min) ya hace la misma recuperación a nivel de Mongo — el
+chequeo nativo queda como capa secundaria. **No se midió el ahorro exacto
+todavía** — vigila el "Usage" de Upstash uno o dos días tras desplegar
+esto, y si sigue alto, el siguiente paso más agresivo es
+`stalledInterval: 0` (desactiva el chequeo nativo por completo, dejando
+solo la reconciliación) o migrar a un plan fijo de Upstash sin cobro por
+comando. Si agregas otro `Worker`/`QueueEvents` (ej. el de Sheets, punto
+21), ten en cuenta que cada uno suma su propio consumo ocioso de este tipo.
+
 ### 5. El worker DIAN es un proceso separado del API — siempre
 
 Nunca metas `dianWorker.ts` a correr dentro de `server.ts`/`app.ts`. En
@@ -888,18 +917,34 @@ la reconciliación de fondo.
 **Disparador 2 — tope/cooldown diario de "Grupo 1"** (sin cliente de por
 medio, `wantsNominalInvoice === false`): solo corre si
 `branchInfo.dianResponsible === true`. Suma el total de ventas de HOY
-(hora Bogotá, `getStartOfTodayColombia()`) con `category: "SPECIAL"` **Y
-`invoiceType: "POS_DOC"`** en esa sede vía `Sale.aggregate` — el filtro
-`invoiceType: "POS_DOC"` es lo que mantiene este cupo independiente del
-Disparador 1 (**decisión explícita, confirmada antes de implementar**: una
-mañana ocupada de facturas pedidas por clientes no debe comerle cupo ni
-reiniciar el cooldown al disparador automático) — con `branchId` casteado
-a mano a `ObjectId` en el `$match` (mismo gotcha de `getDashboardMetrics`:
-`$match` no castea como sí lo hace `Model.find()`) — y calcula `hasSpace =
-(sumaHoy + total) < MAX_GROUP_1`. También exige `thirtyMinutesPassed`
-desde la última venta `SPECIAL`/`POS_DOC` de esa sede (`Sale.findOne`,
-mismo scope + mismo filtro de `invoiceType`). Solo si **ambas** son
+(hora Bogotá, `getStartOfTodayColombia()`) con `category: "SPECIAL"` en esa
+sede vía `Sale.aggregate` — **un solo reloj de cooldown/cupo compartido
+entre los dos disparadores**, cuenta cualquier venta `SPECIAL` de hoy sin
+importar si llegó ahí por el Disparador 1 (cliente pidió factura) o por
+este mismo Disparador 2 — con `branchId` casteado a mano a `ObjectId` en
+el `$match` (mismo gotcha de `getDashboardMetrics`: `$match` no castea
+como sí lo hace `Model.find()`) — y calcula `hasSpace = (sumaHoy + total) <
+MAX_GROUP_1`. También exige `thirtyMinutesPassed` desde la última venta
+`SPECIAL` de esa sede (`Sale.findOne`, mismo scope). Solo si **ambas** son
 ciertas, `category = "SPECIAL"` — si no, `"REGULAR"`.
+
+**Corrección real, revertida de un diseño anterior:** la primera versión
+de este punto filtraba estas dos consultas también por `invoiceType:
+"POS_DOC"`, a propósito, para que el Disparador 1 nunca contara contra el
+cupo/cooldown del Disparador 2 — decisión confirmada antes de
+implementarla. En la práctica, esto produjo un resultado real
+sorprendente: una venta con cliente (Disparador 1, ~10:29am) seguida 18
+minutos después por una venta sin cliente (Disparador 2, ~10:46am) —
+menos de los 30 minutos de cooldown — terminó igual en `category:
+"SPECIAL"`, porque el filtro por `invoiceType` hacía que
+`lastGroup1Item` no encontrara ninguna venta previa que contar (la única
+que había, la del Disparador 1, quedaba excluida por el filtro) y
+`!lastGroup1Item` se evalúa como cooldown ya cumplido. Confirmado con el
+negocio que el comportamiento esperado es el contrario — un solo reloj
+compartido, sin importar el origen de la venta anterior — así que el
+filtro por `invoiceType` se quitó de ambas consultas en los dos
+controladores. Si tocas esta lógica de nuevo, no reintroduzcas ese
+filtro sin discutirlo explícitamente — ya se probó y se revirtió.
 
 **Si el Disparador 2 queda `category: "SPECIAL"`, la venta intenta
 emitirse EN LÍNEA, no se encola** — `dianService.emit(sale)` se llama

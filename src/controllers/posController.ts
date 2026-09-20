@@ -194,10 +194,12 @@ export async function createSale(req: Request, res: Response) {
     category = branchInfo.dianResponsible === true ? "SPECIAL" : "REGULAR";
   } else if (branchInfo.dianResponsible === true) {
     // Disparador 2: la venta pasa a "Grupo 1" según el tope diario/cooldown
-    // ya existentes — el filtro `invoiceType: "POS_DOC"` excluye a propósito
-    // las ventas del disparador 1 de este cálculo, para que una mañana
-    // ocupada de facturas pedidas por clientes no le coma cupo/cooldown al
-    // disparador automático (son dos cupos independientes).
+    // ya existentes — cuenta CUALQUIER venta `category: "SPECIAL"` de hoy,
+    // sin importar si llegó ahí por el Disparador 1 (cliente pidió factura)
+    // o por este mismo Disparador 2 — decisión explícita, revertida de un
+    // diseño anterior que las excluía a propósito (ver punto 37 de
+    // CLAUDE.md): un solo reloj de cooldown/cupo compartido entre ambos
+    // disparadores, no dos cupos independientes.
     const now = Date.now();
 
     // COLOMBIA_TIME_ZONE/COLOMBIA_UTC_OFFSET vienen de utils/dateRange.ts —
@@ -208,7 +210,6 @@ export async function createSale(req: Request, res: Response) {
     const lastGroup1Item = await Sale.findOne({
       branchId: posSession.branchId,
       category: "SPECIAL",
-      invoiceType: "POS_DOC",
       createdAt: { $gte: startOfTodayColombia },
     }).sort({ createdAt: -1 });
 
@@ -222,7 +223,6 @@ export async function createSale(req: Request, res: Response) {
         $match: {
           branchId: new Types.ObjectId(posSession.branchId),
           category: "SPECIAL",
-          invoiceType: "POS_DOC",
           createdAt: { $gte: startOfTodayColombia },
         },
       },

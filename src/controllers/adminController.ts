@@ -1311,10 +1311,11 @@ export async function createSaleAdmin(req: Request, res: Response) {
   if (wantsNominalInvoice) {
     category = branchInfo.dianResponsible === true ? "SPECIAL" : "REGULAR";
   } else if (branchInfo.dianResponsible === true) {
-      // El filtro `invoiceType: "POS_DOC"` excluye a propósito las ventas
-      // del disparador 1 de este cálculo — dos cupos independientes, una
-      // mañana ocupada de facturas pedidas por clientes no le come
-      // cupo/cooldown al disparador automático.
+      // Cuenta CUALQUIER venta `category: "SPECIAL"` de hoy, sin importar si
+      // llegó ahí por el Disparador 1 (cliente pidió factura) o por este
+      // mismo Disparador 2 — decisión explícita, revertida de un diseño
+      // anterior que las excluía a propósito (ver punto 37 de CLAUDE.md): un
+      // solo reloj de cooldown/cupo compartido entre ambos disparadores.
       const now = Date.now();
 
       // COLOMBIA_TIME_ZONE/COLOMBIA_UTC_OFFSET vienen de utils/dateRange.ts —
@@ -1325,7 +1326,6 @@ export async function createSaleAdmin(req: Request, res: Response) {
       const lastGroup1Item = await Sale.findOne({
           branchId,
           category: "SPECIAL",
-          invoiceType: "POS_DOC",
           createdAt: { $gte: startOfTodayColombia },
         }).sort({ createdAt: -1 });
 
@@ -1339,7 +1339,6 @@ export async function createSaleAdmin(req: Request, res: Response) {
             $match: {
               branchId: new Types.ObjectId(branchId),
               category: "SPECIAL",
-              invoiceType: "POS_DOC",
               createdAt: { $gte: startOfTodayColombia },
             },
           },

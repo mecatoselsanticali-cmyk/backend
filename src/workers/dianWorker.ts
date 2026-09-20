@@ -72,6 +72,23 @@ async function main() {
     // Envío intercalado/balanceado: limita cuántos jobs se procesan por segundo (REQ-05)
     limiter: { max: 5, duration: 1000 },
     concurrency: 3,
+    // Ambos valores más altos que el default de BullMQ, a propósito, para
+    // recortar el consumo de comandos en Upstash de un worker que pasa la
+    // gran mayoría del tiempo sin jobs reales (ver punto 2 de CLAUDE.md —
+    // desde el split de disparadores, esta cola solo la usa el Disparador
+    // 1, ya de por sí poco frecuente):
+    // - drainDelay (default 5s): cuánto espera el worker antes de
+    //   reconectar cuando está inactivo. NO retrasa la recogida real de un
+    //   job nuevo — BullMQ despierta al worker casi al instante en cuanto
+    //   se encola algo (ver el "marker" de BullMQ v5), así que subirlo
+    //   solo reduce el churn de reconexión ocioso, no la latencia real.
+    // - stalledInterval (default 30s): cada cuánto revisa jobs "stalled"
+    //   (el worker murió a mitad de proceso). Se sube porque
+    //   reconcilePendingDianSales ya hace el mismo trabajo de recuperación
+    //   a nivel de Mongo cada 5 minutos (ver punto 3) — este chequeo nativo
+    //   de BullMQ queda como capa secundaria, no la única red de seguridad.
+    drainDelay: 60,
+    stalledInterval: 300000,
   });
 
   worker.on("completed", (job) => {

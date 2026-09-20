@@ -457,7 +457,7 @@ sin que eso afecte a quien no lo use.
 `<select>` que arma sus opciones desde uno de estos tres endpoints (el
 selector de sede en `Layout.tsx`/`Topbar.tsx`, el select de sede en
 `UserModal.tsx`, el select de sede en `DianConfig.tsx`, el select de
-producto en `StockModal.tsx` y en `SaleModal.tsx`) le pasa `{ pageSize: 100
+producto en `PurchaseModal.tsx` y en `SaleModal.tsx`) le pasa `{ pageSize: 100
 }` explícitamente y lee `res.data` — no hay una llamada "sin paginar" por
 separado. Si el catálogo de sedes o productos algún día supera 100
 registros, estos selects empezarían a mostrar solo los primeros 100; sube
@@ -536,7 +536,7 @@ armado como `$or` de `$regex`/`$options: "i"` sobre los tres campos, sin
 índice de texto y el catálogo de sedes es demasiado pequeño para
 justificarlo. `Sedes.tsx` es el único consumidor que lo manda; los demás
 consumidores de `listBranches` (los `<select>` de sede en `Layout.tsx`,
-`UserModal.tsx`, `DianConfig.tsx`, `StockModal.tsx`, `SaleModal.tsx`,
+`UserModal.tsx`, `DianConfig.tsx`, `PurchaseModal.tsx`, `SaleModal.tsx`,
 `CashClosureModal.tsx`, todos con `{ pageSize: 100 }`) simplemente no
 mandan `search`, así que quedan sin cambios. Si agregas búsqueda a otro
 endpoint `list*` que no tenga ya un índice de texto, replica este mismo

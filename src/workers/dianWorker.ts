@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import helmet from "helmet";
 import { Worker, Job } from "bullmq";
 import mongoose from "mongoose";
 import { connection } from "../config/redis";
@@ -26,6 +27,9 @@ import { reconcilePendingDianSales } from "../jobs/reconcilePendingDianSales";
 // `PORT`, que Render inyecta automáticamente por su cuenta.
 function startHealthServer() {
   const app = express();
+  // Solo expone /health, pero igual lleva los headers de seguridad estándar
+  // (y sin `X-Powered-By`) — escucha en 0.0.0.0 porque Render debe alcanzarlo.
+  app.use(helmet());
   app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok", service: "mecatos-dian-worker", uptime: process.uptime() });
   });

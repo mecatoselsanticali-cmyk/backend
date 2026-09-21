@@ -13,8 +13,11 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (_req, file, cb) => {
-    if (!file.mimetype.startsWith("image/")) {
-      return cb(new Error("El archivo debe ser una imagen (jpg, png, webp, etc.)"));
+    // Solo formatos de imagen raster — `image/svg+xml` puede llevar scripts
+    // embebidos, y aquí no hace falta (las fotos de producto son jpg/png/webp).
+    if (!file.mimetype.startsWith("image/") || file.mimetype === "image/svg+xml") {
+      // `status: 400` para que el manejador de errores no lo trate como un 500.
+      return cb(Object.assign(new Error("El archivo debe ser una imagen (jpg, png, webp, etc.)"), { status: 400 }));
     }
     cb(null, true);
   },

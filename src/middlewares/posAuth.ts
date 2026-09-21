@@ -31,7 +31,8 @@ export function requirePosSession(req: Request, res: Response, next: NextFunctio
   try {
     const payload = jwt.verify(
       token,
-      process.env.POS_SESSION_SECRET as string
+      process.env.POS_SESSION_SECRET as string,
+      { algorithms: ["HS256"] }
     ) as PosSessionPayload;
     req.posSession = payload;
     next();

@@ -1,5 +1,11 @@
 import { Router } from "express";
 import {
+  adminLoginLimiter,
+  forgotPasswordIpLimiter,
+  forgotPasswordEmailLimiter,
+  resetPasswordLimiter,
+} from "../middlewares/rateLimiters";
+import {
   adminLogin,
   adminMe,
   adminLogout,
@@ -66,10 +72,15 @@ import {
 const router = Router();
 
 // Auth (sin token requerido)
-router.post("/auth/login", asyncHandler(adminLogin));
+router.post("/auth/login", adminLoginLimiter, asyncHandler(adminLogin));
 router.post("/auth/logout", asyncHandler(adminLogout)); // limpia la cookie aunque ya haya expirado
-router.post("/auth/forgot-password", asyncHandler(forgotPassword));
-router.post("/auth/reset-password", asyncHandler(resetPassword));
+router.post(
+  "/auth/forgot-password",
+  forgotPasswordIpLimiter,
+  forgotPasswordEmailLimiter,
+  asyncHandler(forgotPassword)
+);
+router.post("/auth/reset-password", resetPasswordLimiter, asyncHandler(resetPassword));
 
 // A partir de aquí, todas las rutas requieren la cookie admin_token válida
 router.use(requireAdminAuth);

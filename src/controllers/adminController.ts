@@ -664,6 +664,10 @@ export async function createUser(req: Request, res: Response) {
     return res.status(400).json({ error: "Selecciona la sede a la que tendrá acceso este usuario" });
   }
 
+  if (pin !== undefined && pin !== "" && !/^\d{4}$/.test(String(pin))) {
+    return res.status(400).json({ error: "El PIN debe tener exactamente 4 dígitos" });
+  }
+
   if (role === "CASHIER" && pin && (await isPinTakenInBranch(branchId, pin))) {
     return res.status(409).json({ error: "Ese PIN ya está en uso por otro cajero activo de esta sede" });
   }
@@ -744,6 +748,10 @@ export async function updateUser(req: Request, res: Response) {
     branchId = undefined;
   } else if (!branchId) {
     return res.status(400).json({ error: "Selecciona la sede a la que tendrá acceso este usuario" });
+  }
+
+  if (pin !== undefined && pin !== "" && !/^\d{4}$/.test(String(pin))) {
+    return res.status(400).json({ error: "El PIN debe tener exactamente 4 dígitos" });
   }
 
   if (role === "CASHIER" && pin && (await isPinTakenInBranch(branchId, pin, req.params.id))) {

@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt, { SignOptions } from "jsonwebtoken";
 import ms from "ms";
+import { z } from "zod";
 import { User } from "../models/User";
 import { Branch } from "../models/Branch";
 import { setAuthCookie, clearAuthCookie } from "../utils/cookies";
@@ -14,27 +15,49 @@ import { setAuthCookie, clearAuthCookie } from "../utils/cookies";
 import { sendPasswordResetEmail } from "../utils/mailerResend";
 import { generateResetToken } from "../utils/passwordResetToken";
 
+// Validación de entrada de los endpoints públicos (sin sesión). Exigir
+// `z.string()` es lo que impide la inyección NoSQL por tipo: `{"$ne": null}`
+// deja de ser un objeto que Mongo interpreta como filtro y pasa a ser un
+// error de validación (además del rechazo global en middlewares/sanitizeInput.ts).
+const emailField = z.string().trim().toLowerCase().min(3).max(254);
+const adminLoginSchema = z.object({
+  email: emailField,
+  password: z.string().min(1).max(200),
+});
+const forgotPasswordSchema = z.object({ email: emailField });
+const resetPasswordSchema = z.object({
+  token: z.string().min(1).max(200),
+  password: z.string().min(6).max(200),
+});
+const posLoginSchema = z.object({
+  branchId: z.string().regex(/^[a-f\d]{24}$/i),
+  pin: z.string().regex(/^\d{4}$/),
+});
+
+// Hash falso para que "el correo no existe" tarde lo mismo que "la contraseña
+// no coincide" — sin esto, la diferencia de tiempo (bcrypt solo corre si el
+// usuario existe) permitiría descubrir qué correos son cuentas reales.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync("dummy-password-for-timing", 10);
+
 const ADMIN_TOKEN_TTL = process.env.JWT_EXPIRES_IN || "8h";
 const POS_TOKEN_TTL = process.env.POS_SESSION_EXPIRES_IN || "12h";
 
 /** POST /api/admin/auth/login  { email, password } */
 export async function adminLogin(req: Request, res: Response) {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
+  const parsed = adminLoginSchema.safeParse(req.body);
+  if (!parsed.success) {
     return res.status(400).json({ error: "Email y contraseña son requeridos" });
   }
+  const { email, password } = parsed.data;
 
   const user = await User.findOne({ email, role: { $in: ["ADMIN", "MANAGER"] } }).select(
     "+password"
   );
 
-  if (!user || !user.password) {
-    return res.status(401).json({ error: "Credenciales inválidas" });
-  }
-
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) {
+  // Siempre se corre un bcrypt.compare (contra el hash falso si no hay
+  // usuario) para no filtrar por tiempo si el correo existe.
+  const valid = await bcrypt.compare(password, user?.password || DUMMY_PASSWORD_HASH);
+  if (!user || !user.password || !valid) {
     return res.status(401).json({ error: "Credenciales inválidas" });
   }
 
@@ -108,11 +131,11 @@ export async function adminLogout(_req: Request, res: Response) {
  * este endpoint para averiguar qué correos están registrados.
  */
 export async function forgotPassword(req: Request, res: Response) {
-  const { email } = req.body;
-
-  if (!email) {
+  const parsed = forgotPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
     return res.status(400).json({ error: "El correo es requerido" });
   }
+  const { email } = parsed.data;
 
   const genericResponse = {
     message: "Si el correo existe, se envió un enlace de recuperación",
@@ -149,16 +172,17 @@ export async function forgotPassword(req: Request, res: Response) {
 
 /** POST /api/admin/auth/reset-password  { token, password } */
 export async function resetPassword(req: Request, res: Response) {
-  const { token, password } = req.body;
-
-  if (!token || !password) {
+  const parsed = resetPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const { token, password } = req.body || {};
+    if (typeof password === "string" && typeof token === "string" && password.length > 0 && password.length < 6) {
+      return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres" });
+    }
     return res.status(400).json({ error: "Token y nueva contraseña son requeridos" });
   }
-  if (String(password).length < 6) {
-    return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres" });
-  }
+  const { token, password } = parsed.data;
 
-  const tokenHash = crypto.createHash("sha256").update(String(token)).digest("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const user = await User.findOne({
     resetPasswordTokenHash: tokenHash,
     resetPasswordExpires: { $gt: new Date() },
@@ -184,11 +208,11 @@ export async function listActiveBranches(_req: Request, res: Response) {
 
 /** POST /api/pos/auth/login  { branchId, pin } */
 export async function posLogin(req: Request, res: Response) {
-  const { branchId, pin } = req.body;
-
-  if (!branchId || !pin) {
+  const parsed = posLoginSchema.safeParse(req.body);
+  if (!parsed.success) {
     return res.status(400).json({ error: "Sede y PIN son requeridos" });
   }
+  const { branchId, pin } = parsed.data;
 
   const cashiers = await User.find({ branchId, role: "CASHIER", active: true }).select("+pin");
 

@@ -1776,3 +1776,63 @@ self-hostear con `docker-compose.yml`, y se decidió aceptar el riesgo por
 el ahorro de costo — si el volumen real de ventas hace que este hueco
 importe de verdad, la solución no es este archivo, es dejar de usar el
 plan gratis de Render para este proceso.
+
+### 68. Seguridad de la API — rate limiting, `trust proxy`, anti-inyección NoSQL, anti-CSRF y validación de arranque
+
+Ver el punto 68 del `CLAUDE.md` raíz para el resumen y la tabla de variables de
+entorno. Acá el detalle de implementación y por qué está cada pieza donde está.
+
+**Orden en `app.ts`** (importa): `trust proxy` → `helmet` → `cors` → `cookieParser` →
+`express.json` → `morgan` → `Cache-Control: no-store` en `/api` → `requireAllowedOrigin`
+→ `rejectMongoOperators` → rutas → manejador de errores. Los limitadores de login NO
+son globales: van en la ruta (después de `express.json`, porque su llave usa el correo/`branchId` del body).
+
+- **`config/security.ts`** — única fuente de `allowedOrigins` (lo usan `cors` y
+  `originGuard`), `getTrustProxySetting()` y `validateSecurityConfig()`. Esta última se llama
+  en `bootstrap()` de `server.ts` **antes** de `connectDB()`. Decisión deliberada: solo los
+  errores graves detienen el arranque (secreto ausente, `CORS_ORIGIN="*"`, `CORS_ORIGIN`
+  ausente en producción); un secreto corto o `COOKIE_SECURE=false` solo advierte, porque
+  tirar abajo un despliegue que hoy funciona por un secreto de 20 caracteres sería peor que
+  avisar. `SECURITY_STRICT=true` los promueve a errores cuando quieras endurecer.
+- **`middlewares/rateLimiters.ts`** (`express-rate-limit@7`, `MemoryStore`). `skipSuccessfulRequests`
+  en los logins: solo cuentan los intentos **fallidos** (status ≥ 400), así un usuario legítimo
+  nunca se bloquea solo. El PIN tiene dos limitadores (IP y sede) por el tamaño del espacio de PINs.
+  Los `handler` responden 429 con mensaje en español y dejan un `console.warn("[Security]…")`.
+  **Gotcha de prueba**: una petición con body inválido (400 de `zod`) también cuenta como intento
+  fallido — sirve para probar el limitador sin base de datos. **Gotcha de despliegue**: sin
+  `TRUST_PROXY`, en Render todos los clientes comparten IP y el limitador los bloquea juntos.
+- **`middlewares/sanitizeInput.ts`** (`rejectMongoOperators`) — 400 si body/query/params traen
+  claves `$…` o con `.`, hasta profundidad 10. Se **rechaza** en vez de "limpiar" (como hace
+  `express-mongo-sanitize`) para que un intento de inyección quede en los logs. Se eligió
+  código propio sobre esa librería (sin mantenimiento activo) y porque `zod` ya era dependencia.
+  Si alguna vez necesitas una clave con punto en un body legítimo, este middleware la bloqueará:
+  cámbiala en vez de relajar la regla.
+- **`middlewares/originGuard.ts`** (`requireAllowedOrigin`) — en métodos que modifican datos, si
+  llega `Origin` y no está en `CORS_ORIGIN` → 403. Sin `Origin` pasa (curl/servidor).
+- **`authController.ts`** — schemas `zod` para login admin, forgot, reset y PIN (`branchId` = 24
+  hex, `pin` = `^\d{4}$`). Que el campo sea `z.string()` es lo que cierra la inyección por tipo
+  (`{"$ne":null}`). El login admin siempre corre un `bcrypt.compare` (contra `DUMMY_PASSWORD_HASH`
+  si el correo no existe) para no filtrar por tiempo qué correos son cuentas reales. `email` se
+  normaliza a minúsculas, igual que el esquema de `User` (`lowercase: true`).
+- **`adminController.ts` (`createUser`/`updateUser`)** — el PIN de cajero debe ser exactamente 4
+  dígitos (antes solo lo exigía la UI).
+- **`middlewares/adminAuth.ts`/`posAuth.ts`** — `jwt.verify` con `algorithms: ["HS256"]`.
+- **`middlewares/upload.ts`** — rechaza `image/svg+xml` (puede llevar scripts) y sus errores llevan
+  `status: 400`.
+- **Manejador de errores** — en producción los 5xx responden un mensaje genérico (el detalle solo
+  va al log); `CastError` de Mongoose (ID mal formado) → 400; `MulterError` → 400.
+- **`workers/dianWorker.ts`** — su servidor `/health` usa `helmet()`. Sigue escuchando en `0.0.0.0`
+  a propósito (Render necesita alcanzarlo, ver punto 67).
+- **Cookies** (`utils/cookies.ts`) no cambiaron: `httpOnly: true` siempre, `secure` según
+  `COOKIE_SECURE`/`NODE_ENV`, `sameSite` "none" si es `secure` (frontend y backend en dominios
+  distintos) o "lax". Con "none" se depende del chequeo de `Origin` de arriba como defensa anti-CSRF.
+  Si frontend y backend comparten dominio registrable, `COOKIE_SAMESITE=lax` es más seguro.
+- **Verificado en vivo** (levantando `app` sin Mongo y con `curl`): body/query con `$ne`/`$regex` → 400;
+  `Origin: https://evil.com` en POST → 403; 11.º intento fallido de login/PIN → 429 y otra IP no bloqueada;
+  4.º forgot-password → 429; `CORS_ORIGIN="*"` en producción → no arranca.
+- **`npm audit`**: `npm audit fix` (sin `--force`) resolvió la alta de `nodemailer` y las de
+  `express`/`body-parser`/`qs`/`morgan`. Queda una moderada (`uuid` vía `exceljs`; el arreglo baja
+  `exceljs` una versión mayor y no se aplicó).
+- **Pendiente conocido** (ver la lista completa en el raíz): los JWT no se revalidan contra la base por
+  request (un usuario desactivado sigue con sesión hasta que expira), y `updateProduct`/`updateBranch`
+  aceptan el body completo (sin lista blanca de campos).

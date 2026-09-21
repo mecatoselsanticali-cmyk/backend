@@ -30,13 +30,14 @@ import {
   getCurrentShift,
 } from "../controllers/cashClosureController";
 import { requirePosSession } from "../middlewares/posAuth";
+import { posLoginIpLimiter, posLoginBranchLimiter } from "../middlewares/rateLimiters";
 import { asyncHandler } from "../utils/asyncHandler";
 
 const router = Router();
 
 // Auth (sin sesión previa)
 router.get("/auth/branches", asyncHandler(listActiveBranches));
-router.post("/auth/login", asyncHandler(posLogin));
+router.post("/auth/login", posLoginIpLimiter, posLoginBranchLimiter, asyncHandler(posLogin));
 router.post("/auth/logout", asyncHandler(posLogout)); // limpia la cookie aunque ya haya expirado
 router.get("/auth/me", requirePosSession, asyncHandler(posMe));
 router.patch(

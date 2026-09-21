@@ -1,11 +1,13 @@
 import "dotenv/config";
 import app from "./app";
 import { connectDB } from "./config/db";
+import { validateSecurityConfig } from "./config/security";
 
 const PORT = process.env.PORT || 4000;
 
 async function bootstrap() {
   try {
+    validateSecurityConfig();
     await connectDB();
     app.listen(PORT, () => {
       console.log(`[Server] Mecatos ERP backend corriendo en http://localhost:${PORT}`);

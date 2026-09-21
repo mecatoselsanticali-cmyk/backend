@@ -29,7 +29,9 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET as string) as AdminTokenPayload;
+    const payload = jwt.verify(token, process.env.JWT_SECRET as string, {
+      algorithms: ["HS256"], // nunca aceptar el algoritmo que declare el token (ataque "alg: none")
+    }) as AdminTokenPayload;
     req.admin = payload;
     next();
   } catch (err) {

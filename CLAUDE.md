@@ -1836,3 +1836,18 @@ son globales: van en la ruta (después de `express.json`, porque su llave usa el
 - **Pendiente conocido** (ver la lista completa en el raíz): los JWT no se revalidan contra la base por
   request (un usuario desactivado sigue con sesión hasta que expira), y `updateProduct`/`updateBranch`
   aceptan el body completo (sin lista blanca de campos).
+
+**Incidente real en producción (Render) — el limitador por IP no bloqueaba, y un usuario bloqueado entró igual antes de 15 minutos.**
+Tras el primer despliegue, más de 10 intentos con clave errada no bloquearon, y después de ver el 429 una
+clave correcta todavía entró. Causa probable: `req.ip` no era estable entre peticiones (la cadena de proxies
+de Render puede entregar una IP de borde distinta cada vez con `TRUST_PROXY=1`), así que cada intento caía en
+un contador propio de `adminLoginLimiter` (llave `IP|correo`). Se agregó `adminLoginEmailLimiter` (**sin IP** en
+la llave: 20 fallidos/15 min por correo, desde cualquier IP) — probado con una IP distinta en cada intento:
+bloquea a partir del 21.º. El login por PIN ya tenía un limitador por sede sin IP (`posLoginBranchLimiter`).
+Costo asumido: quien conozca un correo puede dejar a ese admin sin poder entrar 15 minutos.
+**Diagnóstico y ajuste de `TRUST_PROXY`**: el log `[Security] Rate limit alcanzado` ahora incluye `ip=` y
+`xff=` (el header `X-Forwarded-For` completo). Si en los logs de `morgan` la IP de un mismo usuario cambia entre
+peticiones y parecen IPs de infraestructura (no la del usuario), probablemente hay más de un proxy delante:
+prueba `TRUST_PROXY=2`. **Ojo**: un valor MAYOR al real permite que un atacante falsifique su IP con un
+`X-Forwarded-For` propio y se salte los limitadores por IP — no lo subas sin comprobar en los logs cuántos
+saltos hay de verdad.

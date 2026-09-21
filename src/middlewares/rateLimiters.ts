@@ -8,7 +8,10 @@ const tooMany = (message: string): Partial<Options> => ({
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
-    console.warn(`[Security] Rate limit alcanzado: ${req.method} ${req.originalUrl} ip=${req.ip}`);
+    console.warn(
+      `[Security] Rate limit alcanzado: ${req.method} ${req.originalUrl} ip=${req.ip} ` +
+        `xff="${req.headers["x-forwarded-for"] || ""}"`
+    );
     res.status(429).json({ error: message });
   },
 });
@@ -29,6 +32,23 @@ export const adminLoginLimiter = rateLimit({
   limit: 10,
   skipSuccessfulRequests: true,
   keyGenerator: (req) => `${req.ip}|${bodyField(req, "email")}`,
+  ...tooMany("Demasiados intentos de ingreso. Intenta de nuevo en 15 minutos."),
+});
+
+/**
+ * Segundo limitador del login de admin, SIN IP en la llave: 20 intentos
+ * fallidos cada 15 min por correo, desde cualquier IP. Cubre el caso en que
+ * `req.ip` no es estable (p. ej. la cadena de proxies de Render entrega una IP
+ * de borde distinta en cada petición: cada una caería en un contador propio y
+ * el límite por IP+correo nunca se alcanzaría) y también un ataque repartido
+ * entre muchas IPs. Costo asumido: quien conozca el correo de un admin puede
+ * dejarlo sin poder entrar 15 minutos — preferible a permitir adivinar la clave.
+ */
+export const adminLoginEmailLimiter = rateLimit({
+  windowMs: WINDOW_15_MIN,
+  limit: 20,
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => `email|${bodyField(req, "email")}`,
   ...tooMany("Demasiados intentos de ingreso. Intenta de nuevo en 15 minutos."),
 });
 

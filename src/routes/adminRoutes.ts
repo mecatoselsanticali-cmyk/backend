@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   adminLoginLimiter,
+  adminLoginEmailLimiter,
   forgotPasswordIpLimiter,
   forgotPasswordEmailLimiter,
   resetPasswordLimiter,
@@ -72,7 +73,7 @@ import {
 const router = Router();
 
 // Auth (sin token requerido)
-router.post("/auth/login", adminLoginLimiter, asyncHandler(adminLogin));
+router.post("/auth/login", adminLoginLimiter, adminLoginEmailLimiter, asyncHandler(adminLogin));
 router.post("/auth/logout", asyncHandler(adminLogout)); // limpia la cookie aunque ya haya expirado
 router.post(
   "/auth/forgot-password",

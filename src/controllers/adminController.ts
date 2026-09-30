@@ -32,8 +32,11 @@ import {
   COLOMBIA_TIME_ZONE,
 } from "../utils/dateRange";
 import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
+import { buildSaleItemFiscalSnapshot } from "../utils/fiscalSnapshot";
 import { sendWelcomeEmail } from "../utils/mailerResend";
 import { generateResetToken } from "../utils/passwordResetToken";
+import { applyInvoiceResult } from "../utils/applyInvoiceResult";
+import { resolveConfiguredInvoiceProvider } from "../services/dian/providers/providerResolver";
 
 /**
  * Un GERENTE (MANAGER) siempre queda restringido a su propia sede (la del
@@ -1277,6 +1280,7 @@ export async function createSaleAdmin(req: Request, res: Response) {
       quantity,
       price: product.price,
       total: product.price * quantity,
+      fiscalSnapshot: buildSaleItemFiscalSnapshot(product),
     };
   });
 
@@ -1387,6 +1391,10 @@ export async function createSaleAdmin(req: Request, res: Response) {
     // "PENDING" sería engañoso (sugiere que algo la va a procesar después,
     // y nada lo hará). Ver punto 37 de CLAUDE.md.
     dianStatus: category === "REGULAR" ? "NOT_EMITTED" : "PENDING",
+    electronicInvoice:
+      category === "SPECIAL"
+        ? { provider: resolveConfiguredInvoiceProvider(), attempts: 0 }
+        : undefined,
     offlineCreated: false,
     stockDecremented: true,
     category,
@@ -1424,14 +1432,11 @@ export async function createSaleAdmin(req: Request, res: Response) {
     // de "Grupo 1" (ver punto 37 de CLAUDE.md). A diferencia del enqueue de
     // arriba, esto SÍ se espera — es la única forma de que `category`/
     // `dianStatus` en la respuesta ya reflejen el resultado real.
+    let needsAsyncFollowUp = false;
     try {
       const result = await dianService.emit(sale);
-      if (result.status === "APPROVED") {
-        sale.dianStatus = "APPROVED";
-        sale.cufe = result.cufe;
-        sale.qrCodeUrl = result.qrCodeUrl;
-        sale.dianInvoiceNumber = result.invoiceNumber;
-      } else {
+      applyInvoiceResult(sale, result);
+      if (result.status === "REJECTED") {
         // "REJECTED", no "NOT_EMITTED" — esta venta SÍ se intentó emitir
         // (a diferencia de una que nunca calificó para el Disparador 2 y
         // nace "NOT_EMITTED" directo, ver más arriba), así que queda
@@ -1441,6 +1446,11 @@ export async function createSaleAdmin(req: Request, res: Response) {
         // las que nunca se intentaron.
         sale.dianStatus = "REJECTED";
         sale.category = "REGULAR";
+      } else if (result.status === "PENDING" || result.status === "SENT") {
+        // El documento puede existir en Factus aunque aún esté pendiente de
+        // validación; conservar categoría/proveedor y seguirlo por su misma
+        // referencia, sin degradar la venta ni generar una factura distinta.
+        needsAsyncFollowUp = true;
       }
     } catch (err) {
       console.error(`[createSaleAdmin] Emisión inline fallida para la venta ${sale._id}:`, err);
@@ -1448,6 +1458,11 @@ export async function createSaleAdmin(req: Request, res: Response) {
       sale.category = "REGULAR";
     }
     await sale.save();
+    if (needsAsyncFollowUp) {
+      enqueueSaleForDianEmission(String(sale._id)).catch((err) => {
+        console.error(`[createSaleAdmin] No se pudo encolar el seguimiento DIAN ${sale._id}:`, err);
+      });
+    }
   }
 
 

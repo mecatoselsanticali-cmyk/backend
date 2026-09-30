@@ -35,6 +35,14 @@ export interface IProduct extends Document {
   // registrado/mapeado en Siigo todavía; una venta con un producto sin este
   // código queda dianStatus: REJECTED con un mensaje claro, no se adivina.
   siigoCode?: string;
+  // Datos fiscales separados del precio/comportamiento comercial del POS.
+  // Factus usa hoy los defaults 94/999 y productos excluidos; taxCode/taxRate
+  // quedan opcionales para una futura clasificación fiscal por producto.
+  unitMeasureCode: string;
+  standardCode: string;
+  isTaxExcluded: boolean;
+  taxCode?: string;
+  taxRate?: number;
 }
 
 const ModifierSchema = new Schema<IModifier>(
@@ -63,6 +71,11 @@ const ProductSchema = new Schema<IProduct>(
     active: { type: Boolean, default: true },
     minStock: { type: Number, default: 0, min: 0 },
     siigoCode: { type: String },
+    unitMeasureCode: { type: String, default: "94" },
+    standardCode: { type: String, default: "999" },
+    isTaxExcluded: { type: Boolean, default: true },
+    taxCode: { type: String },
+    taxRate: { type: Number, min: 0, max: 100 },
   },
   { timestamps: true }
 );

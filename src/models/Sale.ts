@@ -1,4 +1,5 @@
 import { Schema, model, Document, Types } from "mongoose";
+import type { ElectronicInvoiceProviderType } from "../types/electronicInvoice";
 
 export type OrderType = "POS_COUNTER" | "RAPPI" | "DIDI" | "DELIVERY_LOCAL";
 // CASH/CARD/DELIVERY_APP son valores históricos, reemplazados por
@@ -38,6 +39,15 @@ export type SaleStatus = "ACTIVE" | "CANCELLED";
 // partir del monto ni de otras ventas) — ver punto 20 de CLAUDE.md.
 export type SaleCategory = "REGULAR" | "SPECIAL";
 
+export interface ISaleItemFiscalSnapshot {
+  codeReference: string;
+  unitMeasureCode: string;
+  standardCode: string;
+  isTaxExcluded: boolean;
+  taxCode?: string;
+  taxRate?: number;
+}
+
 export interface ISaleItem {
   productId: Types.ObjectId;
   name: string;
@@ -45,12 +55,28 @@ export interface ISaleItem {
   price: number;
   modifiers?: { name: string; extraPrice: number }[];
   subtotal: number;
+  // Foto fiscal de catálogo al momento de la venta. Opcional para preservar
+  // lectura y facturación compatible de ítems históricos.
+  fiscalSnapshot?: ISaleItemFiscalSnapshot;
 }
 
 export interface ISaleCustomer {
   name?: string;
   document?: string;
   email?: string;
+  identificationDocumentCode?: string;
+  legalOrganizationCode?: string;
+}
+
+export interface IElectronicInvoice {
+  provider: ElectronicInvoiceProviderType;
+  externalId?: string;
+  referenceCode?: string;
+  providerStatus?: string;
+  attempts: number;
+  lastAttemptAt?: Date;
+  lastError?: string;
+  rawResponse?: unknown;
 }
 
 export interface ISale extends Document {
@@ -89,6 +115,9 @@ export interface ISale extends Document {
   // recibo ("Factura electrónica de venta No. ...") cuando la venta ya
   // está timbrada. Ver dianService.ts/dianWorker.ts.
   dianInvoiceNumber?: string;
+  // Opcional para compatibilidad con ventas históricas, que no tienen
+  // proveedor electrónico asociado.
+  electronicInvoice?: IElectronicInvoice;
   offlineCreated: boolean;
   localTicketId?: string; // id generado en el cliente offline (Dexie) para deduplicar en sync
   status: SaleStatus;
@@ -108,6 +137,34 @@ const SaleItemSchema = new Schema<ISaleItem>(
     price: Number,
     modifiers: [{ name: String, extraPrice: Number }],
     subtotal: Number,
+    fiscalSnapshot: {
+      type: new Schema<ISaleItemFiscalSnapshot>(
+        {
+          codeReference: { type: String, required: true },
+          unitMeasureCode: { type: String, required: true },
+          standardCode: { type: String, required: true },
+          isTaxExcluded: { type: Boolean, required: true },
+          taxCode: String,
+          taxRate: Number,
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
+  },
+  { _id: false }
+);
+
+const ElectronicInvoiceSchema = new Schema<IElectronicInvoice>(
+  {
+    provider: { type: String, enum: ["MOCK", "SIIGO", "FACTUS"], required: true },
+    externalId: String,
+    referenceCode: String,
+    providerStatus: String,
+    attempts: { type: Number, required: true, default: 0 },
+    lastAttemptAt: Date,
+    lastError: String,
+    rawResponse: Schema.Types.Mixed,
   },
   { _id: false }
 );
@@ -147,6 +204,11 @@ const SaleSchema = new Schema<ISale>(
       name: String,
       document: String,
       email: String,
+      identificationDocumentCode: {
+        type: String,
+        enum: ["11", "12", "13", "21", "22", "31", "41", "42", "47", "48", "50", "91"],
+      },
+      legalOrganizationCode: { type: String, enum: ["1", "2"] },
     },
     invoiceType: {
       type: String,
@@ -162,6 +224,7 @@ const SaleSchema = new Schema<ISale>(
     cufe: String,
     qrCodeUrl: String,
     dianInvoiceNumber: String,
+    electronicInvoice: { type: ElectronicInvoiceSchema, default: undefined },
     offlineCreated: { type: Boolean, default: false },
     localTicketId: { type: String, index: true, sparse: true, unique: true },
     status: { type: String, enum: ["ACTIVE", "CANCELLED"], default: "ACTIVE", index: true },

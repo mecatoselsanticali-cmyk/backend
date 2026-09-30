@@ -14,6 +14,10 @@ export function buildDianJobId(saleId: string) {
   return `dian-emission-${saleId}`;
 }
 
+function isLiveDianJobState(state: string): boolean {
+  return state === "waiting" || state === "active" || state === "delayed" || state === "waiting-children";
+}
+
 /**
  * Encola una venta para emisión electrónica en segundo plano.
  * REQ-05: envío intercalado/balanceado + reintentos con backoff exponencial.
@@ -23,7 +27,10 @@ export function buildDianJobId(saleId: string) {
  * que permite que el job de reconciliación reintente encolar sin miedo a
  * generar doble procesamiento de la misma venta.
  */
-export async function enqueueSaleForDianEmission(saleId: string) {
+export async function enqueueSaleForDianEmission(
+  saleId: string,
+  options: { replaceTerminal?: boolean } = {}
+) {
   // Interruptor temporal para pruebas: con DISABLE_DIAN_QUEUE=true no se
   // manda nada a Redis/Upstash para DIAN (ni siquiera el .add()) — se usó
   // mientras se probaba el proyecto antes de la integración con SIIGO,
@@ -37,6 +44,28 @@ export async function enqueueSaleForDianEmission(saleId: string) {
     console.log(`[dianQueue] DISABLE_DIAN_QUEUE=true — se omite encolar la venta ${saleId}`);
     return;
   }
+
+  if (options.replaceTerminal) {
+    // BullMQ deduplica por jobId incluso cuando el job previo ya terminó, si
+    // removeOnComplete/removeOnFail aún conserva su hash. Solo la
+    // reconciliación necesita quitar ese terminal; el enqueue normal de una
+    // venta nueva conserva el path rápido de un solo `.add()`.
+    const existingJob = await dianQueue.getJob(buildDianJobId(saleId));
+    if (existingJob) {
+      const state = await existingJob.getState();
+      if (isLiveDianJobState(state)) return;
+
+      try {
+        await existingJob.remove();
+      } catch (error) {
+        // Otra corrida pudo quitarlo y crear un job vivo mientras esperábamos.
+        const currentJob = await dianQueue.getJob(buildDianJobId(saleId));
+        if (!currentJob || isLiveDianJobState(await currentJob.getState())) return;
+        throw error;
+      }
+    }
+  }
+
   await dianQueue.add(
     "emit-sale",
     { saleId },
@@ -64,5 +93,5 @@ export async function hasLiveDianJob(saleId: string): Promise<boolean> {
   if (!job) return false;
 
   const state = await job.getState();
-  return state === "waiting" || state === "active" || state === "delayed" || state === "waiting-children";
+  return isLiveDianJobState(state);
 }

@@ -4,8 +4,8 @@ import { enqueueSaleForDianEmission, hasLiveDianJob } from "../queues/dianQueue"
 /**
  * Reconciliación de emisión DIAN.
  *
- * Cubre el caso en el que una venta quedó en dianStatus='PENDING' sin que
- * exista (o sobreviva) un job en la cola que la procese — por ejemplo:
+ * Cubre el caso en el que una venta quedó en dianStatus='PENDING'/'SENT' sin
+ * que exista (o sobreviva) un job en la cola que la procese — por ejemplo:
  *   - Redis estuvo caído justo cuando se intentó encolar tras el cobro
  *     (el controlador de ventas ya tolera este fallo y responde igual al
  *     cajero, ver posController.createSale).
@@ -40,7 +40,7 @@ export async function reconcilePendingDianSales(): Promise<ReconciliationResult>
   const staleThreshold = new Date(Date.now() - STALE_MINUTES * 60 * 1000);
 
   const staleSales = await Sale.find({
-    dianStatus: "PENDING",
+    dianStatus: { $in: ["PENDING", "SENT"] },
     category: "SPECIAL",
     createdAt: { $lt: staleThreshold },
   })
@@ -60,7 +60,7 @@ export async function reconcilePendingDianSales(): Promise<ReconciliationResult>
       continue;
     }
 
-    await enqueueSaleForDianEmission(saleId);
+    await enqueueSaleForDianEmission(saleId, { replaceTerminal: true });
     reenqueued++;
   }
 
@@ -72,7 +72,7 @@ export async function reconcilePendingDianSales(): Promise<ReconciliationResult>
 
   if (result.scanned > 0) {
     console.log(
-      `[Reconciliation] Analizadas ${result.scanned} ventas PENDING (>${STALE_MINUTES}min). ` +
+      `[Reconciliation] Analizadas ${result.scanned} ventas PENDING/SENT (>${STALE_MINUTES}min). ` +
         `Reencoladas: ${result.reenqueued}. Con job vivo (omitidas): ${result.skippedWithLiveJob}.`
     );
   }

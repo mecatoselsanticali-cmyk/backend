@@ -11,6 +11,9 @@ import { logSaleToSheets, logExpenseToSheets, logStockLossToSheets, syncInventor
 import { getCashierShiftStart } from "../utils/shiftRange";
 import { getStartOfTodayColombia } from "../utils/dateRange";
 import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
+import { buildSaleItemFiscalSnapshot } from "../utils/fiscalSnapshot";
+import { applyInvoiceResult } from "../utils/applyInvoiceResult";
+import { resolveConfiguredInvoiceProvider } from "../services/dian/providers/providerResolver";
 import { Types } from "mongoose";
 
 /**
@@ -131,11 +134,17 @@ export async function createSale(req: Request, res: Response) {
   // se revisa ANTES de crear la venta, para poder rechazarla sin dejar
   // ningún rastro si algún ítem no alcanza.
   const productIds = items.map((it: any) => it.productId);
-  const stocks = await ProductStock.find({
-    productId: { $in: productIds },
-    branchId: posSession.branchId,
-  }).lean();
+  const [stocks, fiscalProducts] = await Promise.all([
+    ProductStock.find({
+      productId: { $in: productIds },
+      branchId: posSession.branchId,
+    }).lean(),
+    Product.find({ _id: { $in: productIds } })
+      .select("sku unitMeasureCode standardCode isTaxExcluded taxCode taxRate")
+      .lean(),
+  ]);
   const stockByProduct = new Map(stocks.map((s) => [String(s.productId), s.quantity]));
+  const fiscalProductById = new Map(fiscalProducts.map((product) => [String(product._id), product]));
 
   const insufficient: string[] = [];
   for (const it of items as any[]) {
@@ -151,6 +160,16 @@ export async function createSale(req: Request, res: Response) {
       message: `No hay stock suficiente para: ${insufficient.join(", ")}`,
     });
   }
+
+  // El snapshot se construye en servidor desde Product; nunca se acepta uno
+  // enviado por el navegador. Los tickets offline antiguos siguen sin él.
+  const saleItems = (items as any[]).map((item) => {
+    const product = fiscalProductById.get(String(item.productId));
+    return {
+      ...item,
+      fiscalSnapshot: product ? buildSaleItemFiscalSnapshot(product) : undefined,
+    };
+  });
 
   const subtotal = items.reduce((acc: number, it: any) => acc + it.subtotal, 0);
   // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
@@ -246,12 +265,16 @@ export async function createSale(req: Request, res: Response) {
   // preferible tener el registro de venta para reconciliar a mano que
   // perder stock sin ninguna venta que lo explique.
   const effectiveOrderType = orderType || "POS_COUNTER";
+  const electronicInvoice =
+    category === "SPECIAL"
+      ? { provider: resolveConfiguredInvoiceProvider(), attempts: 0 }
+      : undefined;
 
   const sale = await Sale.create({
     branchId: posSession.branchId,
     cashierId: posSession.cashierId,
     orderType: effectiveOrderType,
-    items,
+    items: saleItems,
     paymentMethod: resolvePaymentMethodForChannel(effectiveOrderType, paymentMethod),
     paymentStatus: resolvePaymentStatus(effectiveOrderType),
     subtotal,
@@ -263,6 +286,7 @@ export async function createSale(req: Request, res: Response) {
     // "PENDING" sería engañoso (sugiere que algo la va a procesar después,
     // y nada lo hará). Ver punto 37 de CLAUDE.md.
     dianStatus: category === "REGULAR" ? "NOT_EMITTED" : "PENDING",
+    electronicInvoice,
     offlineCreated: Boolean(offlineCreated),
     localTicketId,
     stockDecremented: true,
@@ -295,14 +319,11 @@ export async function createSale(req: Request, res: Response) {
     // hace falta reintentar: otra venta más tarde en el mismo día puede
     // cubrir el mismo requisito de "Grupo 1", así que se deja caer a
     // REGULAR en vez de encolar (ver punto 37 de CLAUDE.md).
+    let needsAsyncFollowUp = false;
     try {
       const result = await dianService.emit(sale);
-      if (result.status === "APPROVED") {
-        sale.dianStatus = "APPROVED";
-        sale.cufe = result.cufe;
-        sale.qrCodeUrl = result.qrCodeUrl;
-        sale.dianInvoiceNumber = result.invoiceNumber;
-      } else {
+      applyInvoiceResult(sale, result);
+      if (result.status === "REJECTED") {
         // "REJECTED", no "NOT_EMITTED" — esta venta SÍ se intentó emitir
         // (a diferencia de una que nunca calificó para el Disparador 2 y
         // nace "NOT_EMITTED" directo, ver más arriba), así que queda
@@ -312,6 +333,11 @@ export async function createSale(req: Request, res: Response) {
         // las que nunca se intentaron.
         sale.dianStatus = "REJECTED";
         sale.category = "REGULAR";
+      } else if (result.status === "PENDING" || result.status === "SENT") {
+        // Factus pudo crear la factura aunque todavía no esté validada.
+        // Conservamos SPECIAL/proveedor y dejamos seguimiento por la misma
+        // referencia determinística; no se degrada ni se cambia de PTA.
+        needsAsyncFollowUp = true;
       }
     } catch (err) {
       console.error(`[createSale] Emisión inline fallida para la venta ${sale._id}:`, err);
@@ -319,6 +345,11 @@ export async function createSale(req: Request, res: Response) {
       sale.category = "REGULAR";
     }
     await sale.save();
+    if (needsAsyncFollowUp) {
+      enqueueSaleForDianEmission(String(sale._id)).catch((err) => {
+        console.error(`[createSale] No se pudo encolar el seguimiento DIAN ${sale._id}:`, err);
+      });
+    }
   }
 
   logSaleToSheets(sale).catch((err) => {
@@ -424,6 +455,10 @@ export async function syncOfflineSales(req: Request, res: Response) {
         customer: raw.customer,
         invoiceType: requiresNominal ? "FACTURA_NOMINAL" : "POS_DOC",
         dianStatus: "PENDING",
+        electronicInvoice: {
+          provider: resolveConfiguredInvoiceProvider(),
+          attempts: 0,
+        },
         offlineCreated: true,
         localTicketId: raw.localTicketId,
       });
@@ -476,7 +511,8 @@ export async function getDailyTotal(req: Request, res: Response) {
  * turno sigue abierto no debe "perder" nada) en su sede, con su estado de
  * emisión DIAN (CUFE/QR una vez aprobadas).
  *
- * Incluye items/subtotal/tax/customer/branchId/cashierId (poblados) para que
+  * Incluye items/subtotal/tax/customer/electronicInvoice.provider/
+  * branchId/cashierId (poblados) para que
  * el recibo imprimible de Facturas.tsx (cajero/components/SaleReceipt.tsx)
  * pueda renderizarse directo desde esta lista, sin una segunda llamada —
  * mismo principio que listSales/createSaleAdmin en el panel admin.
@@ -493,7 +529,7 @@ export async function listCashierSales(req: Request, res: Response) {
     .sort({ createdAt: -1 })
     .limit(200)
     .select(
-      "total paymentMethod dianStatus cufe qrCodeUrl createdAt invoiceType orderType items subtotal tax customer status category branchId cashierId"
+      "total paymentMethod dianStatus cufe qrCodeUrl dianInvoiceNumber electronicInvoice.provider createdAt invoiceType orderType items subtotal tax customer status category branchId cashierId"
     )
     .populate("branchId", "name address phone")
     .populate("cashierId", "name");

@@ -1,42 +1,17 @@
-import "dotenv/config";
-import express from "express";
-import helmet from "helmet";
 import { Worker, Job } from "bullmq";
 import mongoose from "mongoose";
 import { connection } from "../config/redis";
-import { connectDB } from "../config/db";
 import { DIAN_QUEUE_NAME, DianJobData } from "../queues/dianQueue";
 import { Sale } from "../models/Sale";
+import type { InvoiceResult } from "../types/electronicInvoice";
 import { dianService } from "../services/dianService";
 import { reconcilePendingDianSales } from "../jobs/reconcilePendingDianSales";
+import { applyInvoiceResult } from "../utils/applyInvoiceResult";
+import { isFinalDianAttempt } from "../utils/dianRetryPolicy";
 
-// Servidor HTTP mínimo, solo para que Render acepte este proceso como Web
-// Service en el plan gratis (que exige un puerto abierto; un Background
-// Worker real requiere plan pago) — ver punto 67 de backend/CLAUDE.md para
-// el detalle completo y los riesgos aceptados de este approach. No agrega
-// `cors`: este endpoint solo lo golpea un monitor externo (UptimeRobot), no
-// un navegador, mismo criterio que `GET /health` del API (punto 58).
-//
-// `DIAN_WORKER_PORT` tiene prioridad sobre `PORT` a propósito — en local,
-// `dianWorker.ts` y `server.ts` cargan el mismo `backend/.env`
-// (`import "dotenv/config"`), que ya trae `PORT=4000` para el API; si este
-// servidor leyera `PORT` directo, correr `npm run dev` y `npm run
-// worker:dian` a la vez revienta con `EADDRINUSE :4000` apenas arranca el
-// segundo. En Render, el servicio del worker no necesita que definas
-// `DIAN_WORKER_PORT` en el dashboard — con esa variable ausente cae solo a
-// `PORT`, que Render inyecta automáticamente por su cuenta.
-function startHealthServer() {
-  const app = express();
-  // Solo expone /health, pero igual lleva los headers de seguridad estándar
-  // (y sin `X-Powered-By`) — escucha en 0.0.0.0 porque Render debe alcanzarlo.
-  app.use(helmet());
-  app.get("/health", (_req, res) => {
-    res.status(200).json({ status: "ok", service: "mecatos-dian-worker", uptime: process.uptime() });
-  });
-  const port = Number(process.env.DIAN_WORKER_PORT) || Number(process.env.PORT) || 3000;
-  app.listen(port, () => {
-    console.log(`[DianWorker] Health check escuchando en :${port}`);
-  });
+export interface DianWorkerHandle {
+  worker: Worker<DianJobData>;
+  stop: () => Promise<void>;
 }
 
 async function processJob(job: Job<DianJobData>) {
@@ -50,47 +25,63 @@ async function processJob(job: Job<DianJobData>) {
     return; // ya procesada (idempotencia)
   }
 
-  const result = await dianService.emit(sale);
+  const isFinalAttempt = isFinalDianAttempt(job.attemptsMade, job.opts.attempts);
+
+  let result: InvoiceResult;
+  try {
+    result = await dianService.emit(sale);
+  } catch (error) {
+    if (isFinalAttempt) {
+      sale.dianStatus = "REJECTED";
+      sale.category = "REGULAR";
+      if (sale.electronicInvoice) {
+        sale.electronicInvoice.lastError = error instanceof Error ? error.message : String(error);
+      }
+      await sale.save();
+    }
+    throw error;
+  }
+
+  applyInvoiceResult(sale, result);
+  if (result.status === "REJECTED" && isFinalAttempt) {
+    // La venta nominal sigue SPECIAL mientras BullMQ aún pueda reintentar;
+    // si el rechazo es terminal, ya no ocupa el grupo de emisión.
+    sale.category = "REGULAR";
+  }
+  await sale.save();
 
   if (result.status === "APPROVED") {
-    sale.dianStatus = "APPROVED";
-    sale.cufe = result.cufe;
-    sale.qrCodeUrl = result.qrCodeUrl;
-    sale.dianInvoiceNumber = result.invoiceNumber;
-    await sale.save();
     console.log(`[DianWorker] Venta ${sale._id} aprobada. CUFE: ${result.cufe}`);
-  } else {
-    sale.dianStatus = "REJECTED";
-    await sale.save();
-    // Lanzar error para que BullMQ dispare el reintento con backoff exponencial
-    throw new Error(result.errorMessage || "Rechazo desconocido del proveedor DIAN");
+    return;
   }
+
+  if (result.status === "PENDING" || result.status === "SENT") {
+    // Factus puede aceptar la factura antes de que DIAN la valide. El job
+    // termina sin repetir inmediatamente el POST; la reconciliación la
+    // retomará con el proveedor ya bloqueado en Sale.electronicInvoice.
+    return;
+  }
+
+  // REJECTED sigue disparando los reintentos/backoff ya configurados en BullMQ.
+  throw new Error(result.error || "Rechazo desconocido del proveedor DIAN");
 }
 
-async function main() {
-  startHealthServer();
-  await connectDB();
-
+/**
+ * Inicializa el worker DIAN dentro del proceso del backend (fase de unificación).
+ * El antiguo proceso independiente (Render Background Worker) y su servidor HTTP
+ * propio fueron retirados: el Express principal ya sirve `GET /health`, así que
+ * basta un único Web Service en Render.
+ */
+export function startDianWorker(): DianWorkerHandle {
   const worker = new Worker<DianJobData>(DIAN_QUEUE_NAME, processJob, {
     connection,
     // Envío intercalado/balanceado: limita cuántos jobs se procesan por segundo (REQ-05)
     limiter: { max: 5, duration: 1000 },
     concurrency: 3,
-    // Ambos valores más altos que el default de BullMQ, a propósito, para
-    // recortar el consumo de comandos en Upstash de un worker que pasa la
-    // gran mayoría del tiempo sin jobs reales (ver punto 2 de CLAUDE.md —
-    // desde el split de disparadores, esta cola solo la usa el Disparador
-    // 1, ya de por sí poco frecuente):
-    // - drainDelay (default 5s): cuánto espera el worker antes de
-    //   reconectar cuando está inactivo. NO retrasa la recogida real de un
-    //   job nuevo — BullMQ despierta al worker casi al instante en cuanto
-    //   se encola algo (ver el "marker" de BullMQ v5), así que subirlo
-    //   solo reduce el churn de reconexión ocioso, no la latencia real.
-    // - stalledInterval (default 30s): cada cuánto revisa jobs "stalled"
-    //   (el worker murió a mitad de proceso). Se sube porque
-    //   reconcilePendingDianSales ya hace el mismo trabajo de recuperación
-    //   a nivel de Mongo cada 5 minutos (ver punto 3) — este chequeo nativo
-    //   de BullMQ queda como capa secundaria, no la única red de seguridad.
+    // Estos valores recortan el consumo ocioso de Upstash en una instancia que
+    // combina API + worker; no retrasan la recogida real de un job nuevo
+    // (ver punto 4 de backend/CLAUDE.md y la nota previa sobre el split de
+    // disparadores: hoy esta cola solo la usa el Disparador 1).
     drainDelay: 60,
     stalledInterval: 300000,
   });
@@ -103,37 +94,78 @@ async function main() {
     console.error(`[DianWorker] Job ${job?.id} falló (intento ${job?.attemptsMade}): ${err.message}`);
   });
 
-  console.log("[DianWorker] Worker de emisión DIAN escuchando...");
+  console.log("[DianWorker] Worker de emisión DIAN escuchando en el mismo proceso del API");
 
-  // Job de reconciliación: reencola ventas 'PENDING' que se quedaron sin job
-  // vivo en la cola (ej. Redis caído justo al cobrar). Corre al arrancar y
-  // luego periódicamente. Vive en el mismo proceso que el worker para no
+  // Job de reconciliación: reencola ventas 'PENDING'/'SENT' que se quedaron
+  // sin job vivo en la cola. Vive en el mismo proceso que el worker para no
   // requerir infraestructura adicional (no es un cron del sistema operativo).
   const intervalMinutes = Number(process.env.RECONCILE_INTERVAL_MINUTES) || 5;
+  let reconcileTimer: NodeJS.Timeout | undefined;
 
-  reconcilePendingDianSales().catch((err) =>
-    console.error("[Reconciliation] Error en la corrida inicial:", err)
-  );
-
-  setInterval(() => {
+  const runReconcileOnce = () =>
     reconcilePendingDianSales().catch((err) =>
-      console.error("[Reconciliation] Error en la corrida periódica:", err)
+      console.error("[Reconciliation] Error:", err)
     );
-  }, intervalMinutes * 60 * 1000);
+
+  runReconcileOnce();
+  reconcileTimer = setInterval(runReconcileOnce, intervalMinutes * 60 * 1000);
 
   console.log(
     `[Reconciliation] Programada cada ${intervalMinutes} minuto(s) (ventas con más de ${
       process.env.RECONCILE_STALE_MINUTES || 2
     } minuto(s) de antigüedad).`
   );
+
+  return {
+    worker,
+    async stop() {
+      if (reconcileTimer) clearInterval(reconcileTimer);
+      await worker.close();
+    },
+  };
 }
 
-main().catch((err) => {
-  console.error("[DianWorker] Error fatal al iniciar el worker:", err);
-  process.exit(1);
-});
+/**
+ * Crea el worker sin iniciar el trabajo periódico, para los tests automatizados
+ * (no crea jobs reales y evita contaminar las pruebas con un setInterval).
+ */
+export function startDianWorkerForTests(): DianWorkerHandle {
+  const worker = new Worker<DianJobData>(DIAN_QUEUE_NAME, processJob, {
+    connection,
+    drainDelay: 60,
+    stalledInterval: 300000,
+  });
+  return {
+    worker,
+    async stop() {
+      await worker.close();
+    },
+  };
+}
 
-process.on("SIGINT", async () => {
-  await mongoose.disconnect();
-  process.exit(0);
-});
+export async function shutdownDianWorker(handle?: DianWorkerHandle): Promise<void> {
+  if (handle) {
+    await handle.stop();
+  }
+}
+
+// Compatibilidad temporal: si se invoca este archivo con `ts-node`/`node`, se
+// conserva el comportamiento anterior para depuración local (mismo proceso que
+// el API). En Render ya no se usa porque el worker vive dentro de `npm run dev`
+// y del binario compilado del API.
+if (require.main === module) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { connectDB } = require("../config/db");
+  (async () => {
+    await connectDB();
++    startDianWorker();
+  })().catch((err) => {
+    console.error("[DianWorker] Error fatal al iniciar:", err);
+    process.exit(1);
+  });
+
+  process.on("SIGINT", async () => {
+    await mongoose.disconnect();
+    process.exit(0);
+  });
+}

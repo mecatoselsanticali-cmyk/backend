@@ -8,6 +8,89 @@ raíz (no se renumeraron al dividir el documento) — si ves un comentario en
 el código que diga "ver punto 19 de CLAUDE.md", el índice del archivo raíz
 te dice en cuál de estos archivos vive cada número.
 
+**Contrato común, seguimiento y resolución DIAN (Fases 1–8 de la integración Factus/Siigo)**:
+`backend/src/types/electronicInvoice.ts` define `ElectronicInvoiceProviderType`
+(`MOCK`/`SIIGO`/`FACTUS`), `InvoiceResultStatus`, `InvoiceResult` y la interfaz
+`ElectronicInvoiceProvider.issueInvoice(sale)`. `Sale` ahora también admite
+el subdocumento opcional `electronicInvoice` (`IElectronicInvoice` en
+`backend/src/models/Sale.ts`) con proveedor, ids/referencia externa, estado
+del proveedor, intentos, fecha del último intento, último error y respuesta
+cruda. `attempts` inicia en 0; el subdocumento no se crea por defecto, de
+modo que las ventas históricas sin él siguen siendo válidas y no requieren
+migración. `dianService.emit()` respeta primero el provider bloqueado en
+`Sale.electronicInvoice.provider`. Factus está cableado, pero no es el default;
+el ambiente vigente sigue eligiendo MOCK/SIIGO/FACTUS. En ventas nuevas
+`SPECIAL`, los controladores guardan el provider antes de encolar o llamar
+inline; una venta histórica sin subdocumento toma la configuración vigente y
+la persiste antes de contactar al PTA. El worker conserva ese provider en cada
+reintento y la reconciliación retoma estados `PENDING`/`SENT`. El subdocumento ya registra
+intentos, fecha, id/referencia, estado externo y último error; `rawResponse`
+no se persiste. `Product` trae defaults fiscales de
+unidad `94`, estándar `999` e ítem excluido; cada venta nueva creada por
+`posController.createSale` o `adminController.createSaleAdmin` copia esos
+datos (SKU, códigos de unidad/estándar y clasificación tributaria) en
+`SaleItem.fiscalSnapshot`. El subdocumento es opcional para ventas históricas.
+`syncOfflineSales` no fabrica un snapshot de hoy para tickets viejos; si un
+ítem histórico no tiene snapshot, el mapper Factus cae al catálogo actual.
+`taxCode`/`taxRate` son opcionales: solo se usan si un producto deja de estar
+excluido y se le configura una clasificación gravada completa. El resolver
+`backend/src/services/dian/providers/providerResolver.ts` mantiene un
+registro explícito de instancias; `registerInvoiceProvider()` no permite
+reemplazar silenciosamente un proveedor ya registrado y `getInvoiceProvider()`
+falla claramente si se solicita uno no registrado. MOCK, SIIGO y FACTUS se
+registran al cargar `dianService.ts`; ese registro no hace llamadas de red.
+La selección es `ELECTRONIC_INVOICE_PROVIDER` → `DIAN_PROVIDER` (compatibilidad
+temporal) → `MOCK`. Antes de cambiar SIIGO→FACTUS, drena/revisa las ventas
+antiguas `PENDING` sin provider guardado: por compatibilidad esas ventas
+tomarán el provider vigente cuando se procesen por primera vez.
+En `docker-compose.yml`, ambas variables selectoras y `FACTUS_*` se pasan al
+API y al worker, con valores seguros (`MOCK`/sandbox, credenciales vacías) si
+no se definen. En despliegues separados configura `ELECTRONIC_INVOICE_PROVIDER`
+en ambos servicios; los jobs nuevos llevan el provider guardado en Mongo, y el
+worker respeta ese lock.
+
+**Factus (Fases 5–7, seleccionable por configuración pero no default)**:
+`services/dian/providers/FactusInvoiceProvider.ts` implementa OAuth password
+grant + refresh token, caché en memoria con expiración del `expires_in`, un
+reintento de `401` y reintentos `429` respetando `Retry-After`. Usa
+`FACTUS_ENV` (`sandbox` por default; producción solo si se configura
+explícitamente), `FACTUS_CLIENT_ID`, `FACTUS_CLIENT_SECRET`,
+`FACTUS_USERNAME`, `FACTUS_PASSWORD`, `FACTUS_NUMBERING_RANGE_ID` (opcional
+si la cuenta tiene un solo rango activo) y `FACTUS_SEND_EMAIL` (default
+`false`). Ninguna credencial/token sale del backend ni se incluye en
+`InvoiceResult.rawResponse`.
+
+`FactusInvoiceMapper.ts` genera `reference_code: SALE-<saleId>` para que un
+reintento consulte/recupere la factura existente en vez de crear otra; usa
+`Product.sku`, códigos oficiales `unit_measure_code: 94` y
+`standard_code: 999`, precio neto, y la decisión aprobada de marcar todos los
+ítems como excluidos (`taxes: [{ is_excluded: true }]`). Esto no modifica
+`Sale.tax` (sigue en 0) ni el precio comercial. El mapeo oficial de pagos es:
+`CASH`/`EFECTIVO` → `1`/`10`; `NEQUI` → `1`/`47`; `BANCOLOMBIA` → `1`/`47`;
+`CARD` legacy → `1`/`49` (débito); `DELIVERY_APP` legacy → `1`/`47`. Para
+Rappi/DiDi se representa contado por transferencia (`1`/`47`), porque la
+pendiente de liquidación con la app es interna y el consumidor ve transferencia
+Bancolombia. La tabla `98` (CATS/Nequi) pertenece a nómina, no al catálogo de
+métodos de pago de facturas Factus.
+
+Las facturas usan los datos de empresa configurados en Factus (no se envía
+`establishment`, cuyo objeto exigiría correo y código municipal que `Branch`
+no guarda). Factura estándar a consumidor final usa los valores del ejemplo
+oficial de Factus (`13`, `22222222222`, `Consumidor Final`). Para factura
+nominal, el cajero captura además `identificationDocumentCode` y
+`legalOrganizationCode`; ambos se guardan en `Sale.customer`. Una solicitud
+nominal sin estos campos se rechaza con mensaje claro. Todavía no se ha
+llamado a la API real de Factus; las verificaciones locales usan HTTP
+simulado. Para habilitarlo, configura `ELECTRONIC_INVOICE_PROVIDER=FACTUS`;
+los jobs nuevos guardan ese provider en la venta antes de encolarse.
+
+`npm test` ejecuta `backend/test/electronicInvoice.test.cjs` con `node:test`
+y el `ts-node` existente, sin instalar dependencias. Cubre precedencia/config
+de provider, bloqueo por venta, mapper, OAuth password/refresh, `401`, `429`
+con `Retry-After`, recuperación de referencia duplicada, timeout de resultado
+incierto, defaults/snapshot fiscal y documentos históricos. Todo el HTTP de
+Factus está simulado; el test no contacta sandbox ni producción.
+
 ### 1. Todo controlador async DEBE envolverse en `asyncHandler`
 
 `backend/src/utils/asyncHandler.ts` envuelve cada handler de ruta. **Nunca**
@@ -31,23 +114,28 @@ inline" a secas. Ya no es cierto — desde el punto 37 (reescrito), `category:
 "SPECIAL"` tiene dos disparadores distintos con distinto tratamiento:
 
 - **Disparador 1 (el cliente pidió factura electrónica)**: sigue el patrón
-  de siempre, sin cambios — `dianService.emit()` **solo se llama desde
-  `workers/dianWorker.ts`**, nunca desde el controlador:
+  asíncrono — al crear la venta se guarda `electronicInvoice.provider`
+  (ELECTRONIC_INVOICE_PROVIDER → DIAN_PROVIDER → MOCK) ANTES de encolarla;
+  `dianService.emit()` **solo se llama desde `workers/dianWorker.ts`**,
+  nunca desde el controlador:
 
 ```
 controlador → guarda Sale en Mongo (dianStatus: PENDING)
+            → electronicInvoice={provider, attempts: 0}
             → enqueueSaleForDianEmission(saleId)  [try/catch, nunca debe tumbar la respuesta]
             → responde al cliente inmediatamente
             ↓ (en otro proceso)
-worker → toma el job → dianService.emit() → actualiza Sale.dianStatus
+worker → toma el job → dianService.emit() (usa provider bloqueado) → actualiza campos DIAN
 ```
 
 - **Disparador 2 (tope/cooldown diario de "Grupo 1", sin cliente de por
   medio)**: `posController.createSale`/`adminController.createSaleAdmin`
-  **sí llaman a `dianService.emit()` directo, síncrono, antes de responder**
-  — un solo intento, sin reintentos, cae a `category: "REGULAR"` si falla.
-  Ver punto 37 para el razonamiento completo (por qué este disparador
-  específico puede permitirse fallar sin reintentar, y el otro no).
+  guardan el provider bloqueado y **sí llaman a `dianService.emit()` directo,
+  síncrono, antes de responder**. Un `REJECTED` o una excepción mantiene la
+  regla previa (un intento, cae a `REGULAR`); si Factus ya creó la factura y
+  responde `PENDING`/`SENT`, se conserva `SPECIAL` y se encola seguimiento
+  con el mismo provider/referencia, nunca se crea otra factura a nombre de
+  otro PTA. Ver punto 37 para el razonamiento del disparador.
 
 Si agregas un nuevo flujo que genera ventas (ej. webhook de Rappi/DiDi),
 sigue el patrón del Disparador 1 (encolar, nunca llamar `emit()` inline) —
@@ -59,28 +147,32 @@ controlador.
 
 `backend/src/jobs/reconcilePendingDianSales.ts` corre dentro de
 `dianWorker.ts` (setInterval, cada `RECONCILE_INTERVAL_MINUTES`) y también vía
-`npm run reconcile:dian` (manual). Reencola ventas `dianStatus: PENDING` con
+`npm run reconcile:dian` (manual). Reencola ventas `dianStatus: PENDING` o
+`SENT` con
 más de `RECONCILE_STALE_MINUTES` de antigüedad que no tengan ya un job vivo en
 la cola (deduplicación por `jobId` determinístico: `dian-emission-<saleId>`,
 ver `hasLiveDianJob()` en `queues/dianQueue.ts`).
+
+`enqueueSaleForDianEmission()` conserva la deduplicación de jobs vivos. La
+reconciliación lo invoca con `replaceTerminal: true`: elimina antes un hash
+terminal (`completed`/`failed`) retenido por `removeOnComplete`/`removeOnFail`,
+porque BullMQ ignora otra alta con el mismo `jobId` mientras ese hash exista.
+El enqueue inicial de una venta nueva no hace esa consulta adicional a Redis.
 
 **A propósito no reintenta ventas `REJECTED`** (fallaron los 5 reintentos del
 worker) — esas requieren revisión manual en `/ventas` del admin, porque un
 rechazo definitivo del PTA suele ser un problema de datos, no de
 infraestructura. No cambies esto sin discutirlo explícitamente.
 
-**Bug real encontrado y corregido — el filtro también exige `category:
-"SPECIAL"`, no solo `dianStatus: "PENDING"`.** Toda venta se crea con
-`dianStatus: "PENDING"` sin importar su `category` (`posController.createSale`
-/`adminController.createSaleAdmin`), pero el encolado real al crearse solo
-ocurre si `category` salió `"SPECIAL"` (ver punto 37) — una venta `REGULAR`
-(o de una sede sin `dianResponsible`) queda `PENDING` para siempre a
-propósito, porque nunca debía transmitirse. Antes de esta corrección, el
-`Sale.find` de este job no filtraba por `category`, así que no podía
-distinguir "se perdió el encolado real de una `SPECIAL`" de "esta venta
-nunca debía encolarse" — ambos casos se ven idénticos como `PENDING` — y
-terminaba reencolando (y timbrando de verdad) ventas `REGULAR` en cada
-corrida, silenciosamente. Si agregas otra categoría/condición nueva que
+**Bug real encontrado y corregido — el filtro exige `category: "SPECIAL"`,
+no basta con `dianStatus: "PENDING"`/`"SENT"`.** Solo las `SPECIAL` se
+emiten/reconcilian (ver punto 37); las `REGULAR` nuevas son `NOT_EMITTED` y
+nunca deben rescatarse. Históricamente hubo ventas `REGULAR` en `PENDING` antes
+de existir `NOT_EMITTED`, por lo que el filtro de categoría sigue siendo
+necesario para no timbrarlas al reconciliar. Antes de la corrección, el
+`Sale.find` de este job no filtraba por `category` y terminaba reencolando
+(y timbrando de verdad) ventas que nunca debían llegar a DIAN. Si agregas
+otra categoría/condición nueva que
 decida si una venta se transmite o no, replica el mismo filtro acá — de lo
 contrario este job vuelve a "rescatar" ventas que nunca debieron llegar a
 DIAN.
@@ -117,7 +209,7 @@ de BullMQ nunca está realmente ocioso contra Redis: reconecta su llamada
 bloqueante cada `drainDelay` (default 5s) y revisa jobs "stalled" cada
 `stalledInterval` (default 30s), lo que da ~1-1.5 comandos/segundo sin
 parar (~86k-130k/día) — justo lo que se vio. Y como el worker se mantiene
-despierto 24/7 a propósito (UptimeRobot, ver punto 67), ese consumo es
+despierto 24/7 a propósito (UptimeRobot, ver punto 58), ese consumo es
 continuo. Desde el split de disparadores del punto 37, esta cola solo la
 usa el Disparador 1 (poco frecuente), así que el consumo ocioso dominaba
 casi por completo el uso real de Redis.
@@ -173,12 +265,20 @@ desarrollo (el host de la URL pegada no resolvía en DNS, probablemente esa
 instancia ya se reemplazó) — si hace falta, correr esa consulta de solo
 lectura con el `REDIS_URL` vigente.
 
-### 5. El worker DIAN es un proceso separado del API — siempre
+### 5. El worker DIAN corre dentro del mismo proceso del API
 
-Nunca metas `dianWorker.ts` a correr dentro de `server.ts`/`app.ts`. En
-despliegues (Railway, Render, Docker) son dos servicios distintos que
-comparten Mongo y Redis. `docker-compose.yml` ya lo modela así (`backend` y
-`dian-worker`).
+`server.ts` llama a `startDianWorker()` (`src/workers/dianWorker.ts`) justo
+después de `connectDB()`, antes de abrir el socket HTTP. Express y el
+Worker DIAN comparten `server.ts` y viven en el mismo event loop: el
+endpoint `GET /health` del API principal cubre el monitoreo externo del
+trabajo, así que **un único Web Service en Render** mantiene ambos
+despiertos. El `docker-compose.yml` ya lo modela así: solo aparece el
+servicio `backend` con `node dist/server.js`, no hay `dian-worker` aparte.
+El script `npm run worker:dian` se conserva solo por compatibilidad /
+depuración local (registra el mismo worker aislado de Mongo/Redis en una
+corrida independiente); en Render ya no se usa. `workers/sheetsWorker.ts`
+sigue siendo independiente (no necesita Mongo, solo Redis), igual que
+antes.
 
 ### 7. jwt.sign y tipos de `expiresIn`
 
@@ -187,45 +287,44 @@ acepta `string` genérico). Si agregas una nueva firma de JWT, sigue el patrón
 ya usado en `authController.ts`: tipar explícitamente como `SignOptions` y
 castear `expiresIn as SignOptions["expiresIn"]`.
 
-### 10. `dianService.ts` es el único punto de integración con el PTA — ahora con Siigo real (`DIAN_PROVIDER=SIIGO`), además de `MOCK`
+### 10. `dianService.ts` resuelve el proveedor bloqueado por venta (`MOCK`/`SIIGO`/`FACTUS`)
 
-Todo el cambio para conectar un PTA real vive dentro de `dianService.ts`
-(la clase `DianService` + un puñado de funciones exportadas junto a ella) —
-el worker, la cola y los controladores no se tocaron ni deberían tocarse
-para esto, siguen sin saber qué proveedor hay detrás.
+`dianService.ts` se conserva como fachada compatible para el worker y los
+controladores. SIIGO, FACTUS y MOCK implementan `ElectronicInvoiceProvider`
+en `services/dian/providers/`; el worker/controladores usan `dianService.emit()`
+que toma `sale.electronicInvoice.provider` y devuelve `InvoiceResult`. La cola
+solo lleva `saleId`, de modo que los reintentos resuelven el mismo provider
+desde Mongo, no desde el ambiente actual.
 
-**Estado real**: el PTA elegido es **Siigo** (confirmado contra
+**Estado real**: el PTA que sigue en uso por ahora es **Siigo** (confirmado contra
 `siigo_test/`, un proyecto de exploración aparte con la cuenta real de
-producción de Siigo — `Partner-Id: MecatosElSanti`). **`DIAN_PROVIDER=SIIGO`
-ya está activo en `.env` de este ambiente de desarrollo** — no es un modo de
-prueba del lado de Siigo, cada venta que el worker procese con esa
-configuración queda timbrada de verdad ante la DIAN. El fallback de
-`private mode = process.env.DIAN_PROVIDER || "SIIGO"` en la clase
-`DianService` **también quedó en `"SIIGO"` (no `"MOCK"`)** — si algún
-ambiente nuevo arranca sin `DIAN_PROVIDER` definida en absoluto, cae en
-SIIGO real por default, no en el simulador. Si vas a levantar un ambiente
-de desarrollo nuevo (o le pasas este repo a alguien más), ponle
-`DIAN_PROVIDER=MOCK` explícito en su `.env` — no asumas que el default es
-seguro.
+producción de Siigo — `Partner-Id: MecatosElSanti`). `ELECTRONIC_INVOICE_PROVIDER`
+es la nueva variable de selección; `DIAN_PROVIDER` se conserva temporalmente
+como fallback compatible. Si el provider efectivo es `SIIGO`, las emisiones
+llegan a la cuenta real y quedan
+timbradas ante la DIAN; Siigo no tiene un sandbox separado con esas
+credenciales. Precedencia: `ELECTRONIC_INVOICE_PROVIDER` → `DIAN_PROVIDER`
+→ `MOCK`. Configura el valor explícitamente y verifica el entorno antes de
+probar.
 
-**Gotcha real ya vivido — probar cambios acá exige reiniciar el worker a
-mano, y es fácil terminar con dos corriendo a la vez**: `dianService.ts`
-solo lo ejecuta `dianWorker.ts` (punto 5), y ese proceso corre como
-`ts-node src/workers/dianWorker.ts` **sin nodemon** — a diferencia de
-`npm run dev` (la API, bajo `nodemon --watch src`), el worker no se
-reinicia solo ante un cambio de código NI ante un cambio de `.env`
-(`dotenv/config` solo lee el archivo una vez, al arrancar el proceso).
-`this.mode` además se fija una sola vez en el constructor de
-`DianService`, no se re-evalúa en cada `emit()`. Pasó de verdad: se editó
-`dianService.ts` y `.env` varias veces con el worker viejo todavía corriendo
-en segundo plano, y "no pasaba nada" — el proceso viejo seguía ejecutando
-el código/env de cuando arrancó. **Cada cambio a `dianService.ts` o a
-`DIAN_PROVIDER`/cualquier `SIIGO_*` en `.env` exige matar y volver a correr
-`npm run worker:dian`.** Ojo además con terminar con **dos workers vivos a
-la vez** (uno viejo sin matar + uno nuevo) — ambos consumen de la misma
-cola BullMQ, así que da resultados confusos/duplicados mientras el viejo
-sigue vivo; verificar con `ps aux | grep dianWorker` antes de asumir que
-solo hay uno.
+**Provider lock**: toda venta `SPECIAL` guarda `{provider, attempts: 0}` antes
+del enqueue o de la emisión inline. `dianService.emit()` conserva el provider
+si ya está guardado; solo para una venta histórica sin subdocumento resuelve
+el valor actual del ambiente y lo guarda antes de llamar al PTA. Por tanto,
+cambiar el ambiente no cambia el provider de ventas ya bloqueadas. Antes de
+pasar el default de SIIGO a FACTUS, revisa/drena las ventas históricas
+`PENDING` sin provider, porque tomarán el nuevo valor cuando se procesen.
+
+**Gotcha real — probar cambios en el provider exige reiniciar el único
+proceso backend y verificar que solo quede uno activo**: API + worker DIAN
+viven en el mismo proceso desde `server.ts`, por lo que **basta reiniciar
+`npm run dev` / `npm start` para reflejar cambios en `dianService.ts`,
+`dianService` providers o en variables como `ELECTRONIC_INVOICE_PROVIDER`,
+`DIAN_PROVIDER`, `SIIGO_*` o `FACTUS_*`** (el worker no se reinicia solo
+porque ahora comparte destino con el API). Por la misma razón, conviene
+asegurarse de matar el proceso viejo antes de arrancar el nuevo para
+evitar dos workers consumiendo la misma cola — verificar con `ps aux |
+grep node` antes de asumir que solo hay uno.**
 
 **`npm run test:siigo`** (`backend/src/utils/testSiigoIntegration.ts`) — el
 único comando seguro para probar la integración sin arriesgar una factura
@@ -249,7 +348,7 @@ con nombres reales de sedes como "Mecatos el Santi Boulevard"). Por eso
 `Branch.dianConfig.siigoSellerId`/`siigoDocumentId` (nuevos campos, junto a
 `prefix`/`resolutionNumber`/`from`/`to`/`current`/`techKey` que ya existían
 para una integración directa con la DIAN que nunca se llegó a usar).
-`siigoEmit` hace `Branch.findById(sale.branchId)` y rechaza con
+`SiigoInvoiceProvider.issueInvoice` hace `Branch.findById(sale.branchId)` y rechaza con
 `REJECTED` + mensaje claro si a esa sede le falta cualquiera de los dos —
 igual que con `dianResponsible`, cada sede se configura por separado.
 `admin-frontend`/`DianConfig.tsx` (ver ese archivo, sección "Integración
@@ -263,7 +362,7 @@ para saber qué valores poner ahí antes de activarlos.
 nueva marcada `dianResponsible` — `BranchModal.tsx` (el formulario de
 crear/editar sede) no expone ningún campo de Siigo, así que sin este
 default una sede nueva quedaba con `dianConfig` vacío y **cualquier
-venta suya rechazaba en `siigoEmit`** hasta que un admin entrara a mano a
+venta suya rechazaba en `SiigoInvoiceProvider.issueInvoice`** hasta que un admin entrara a mano a
 `DianConfig.tsx` a completarlo. El efecto real: mientras esto no se
 resuelva de verdad, **todas las sedes `dianResponsible` (no solo
 Boulevard) emiten facturas atribuidas al mismo vendedor/resolución de
@@ -278,7 +377,7 @@ práctica.
 
 **Mapeo de producto → Siigo**: `Product.siigoCode` (nuevo campo opcional en
 `models/Product.ts`) es el código del producto en el catálogo de Siigo (ej.
-`"cpfma01"`). `siigoEmit` busca los `Product` de los items de la venta y
+`"cpfma01"`). `SiigoInvoiceProvider.issueInvoice` busca los `Product` de los items de la venta y
 rechaza con `REJECTED` (mensaje con el nombre del producto sin mapear) si
 alguno no tiene `siigoCode` — no hay fallback ni adivinanza. Como con
 `REJECTED` por cualquier otra razón (punto 3), esto no se reintenta solo:
@@ -324,7 +423,7 @@ pendiente**: `SIIGO_PAYMENT_ID_CARD` — el catálogo real de la cuenta no
 tiene "Tarjeta Débito/Crédito" activas; decisión de negocio pendiente, no
 un olvido (irrelevante en la práctica ya que `CARD` es legacy-only, nunca
 se ofrece en ninguna venta nueva). Sin el mapeo para el método de la
-venta, `siigoEmit` rechaza con mensaje claro en vez de adivinar un id.
+venta, `SiigoInvoiceProvider.issueInvoice` rechaza con mensaje claro en vez de adivinar un id.
 
 **Cliente por default**: si `Sale.customer.document` no viene (venta sin
 datos de cliente, el caso normal de un Documento POS Electrónico),
@@ -339,10 +438,10 @@ se resuelva (¿crear el cliente en Siigo antes de facturar? ¿ese endpoint lo
 permite inline?) — pendiente de probar con una Factura Nominal real.
 
 **Token de Siigo cacheado en memoria del proceso** (`cachedSiigoToken` en
-`dianService.ts`, variable de módulo) — evita loguearse contra `/auth` en
+`services/dian/providers/SiigoInvoiceProvider.ts`, variable de módulo) — evita loguearse contra `/auth` en
 cada venta que procese el worker. `SIIGO_TOKEN_TTL_MINUTES` (default 12h)
 es conservador porque Siigo no documenta la duración exacta del token; si
-una request real responde 401 con el token cacheado, `siigoEmit` limpia el
+una request real responde 401 con el token cacheado, `SiigoInvoiceProvider.issueInvoice` limpia el
 cache y reintenta una sola vez con un token fresco antes de rendirse.
 
 **Forma de la respuesta de Siigo — ya verificada contra facturas reales
@@ -361,24 +460,25 @@ el rediseño del recibo (ver más abajo) — antes no se persistía en
 ningún lado pese a que `SaleReceipt.tsx` ya necesitaba mostrarlo.
 
 **Rediseño del recibo (pantalla + ticket térmico) para mostrar el bloque
-DIAN real** — antes ninguno de los dos (`SaleReceipt.tsx` ×2 copias,
+DIAN real con provider dinámico** — antes ninguno de los dos (`SaleReceipt.tsx` ×2 copias,
 `pos-printer-server/index.js`) leía `cufe`/`qrCodeUrl` para nada, pese a
 que ya estaban en el modelo desde la integración con Siigo; ambos
 mostraban siempre "Factura electrónica en proceso de validación DIAN."
 sin importar el estado real. Ahora:
 - `SaleReceipt.tsx` calcula `showDianBlock = sale.dianStatus ===
   "APPROVED" && Boolean(sale.cufe)` **una sola vez** y lo manda en el
-  `PrintReceiptPayload` — `pos-printer-server` no reimplementa esa
-  condición, solo lee el booleano (ver punto 32 en
+  `PrintReceiptPayload` junto con `dianProvider` — `print-server` no
+  reimplementa la condición de aprobación; usa la etiqueta del provider para
+  la atribución y rechaza un bloque DIAN marcado como MOCK (ver punto 32 en
   `pos-printer-server/CLAUDE.md` para el detalle completo del lado del
   ticket físico/QR/`qr-image`).
 - Cuando `true`: NIT (constante hardcodeada `1144209364-9` en las 3
   copias del recibo, no varía por sede — confirmado contra facturas
   reales ya aprobadas por la DIAN de esta cuenta Siigo), "Factura
   electrónica de venta No. {dianInvoiceNumber}", CUFE, un QR (codifica
-  `qrCodeUrl`, el link de Siigo al documento — no un QR generado a partir
-  del CUFE solo), el aviso legal de letra de cambio (Ley 1231 de 2008),
-  atribución a Siigo S.A.S. como PTA, y — solo si
+  `qrCodeUrl` del provider: Factus `links.qr`; Siigo `public_url`), el aviso
+  legal de letra de cambio (Ley 1231 de 2008), atribución dinámica de marca
+  (`Siigo`/`Factus`, sin razón social inventada), y — solo si
   `Branch.dianConfig.resolutionNumber` está poblado (hoy vacío en todas
   las sedes) — la línea de Resolución DIAN.
 - **A propósito NO se incluyó una tabla de Impuestos/Impoconsumo** — el
@@ -387,8 +487,10 @@ sin importar el estado real. Ahora:
   hardcodeado por `siigo_test`) — el negocio sigue sin declarar/cobrar
   impuestos (`Sale.tax` siempre 0, punto 65), así que replicar esa tabla
   habría sido inconsistente con el resto del sistema.
-- Cuando `false` (PENDING/SENT/REJECTED, o un mock sin cufe): el mensaje
-  genérico de siempre, sin cambios.
+- Cuando `false` (PENDING/SENT/REJECTED): mensaje genérico. `MOCK` muestra
+  una advertencia explícita de simulación y nunca imprime CUFE/QR/número falso
+  como factura válida DIAN. Ventas previas al provider lock (`LEGACY`) usan
+  atribución genérica, no una marca asumida.
 - `qrcode.react` (nueva dependencia de `frontend/package.json`,
   `QRCodeSVG`) renderiza el QR en pantalla — no existía ninguna librería
   de QR en el proyecto antes de esto.
@@ -399,7 +501,7 @@ factura real: el `POST` devolvió `response.ok: true` pero `stamp.cufe`
 venía vacío en ese mismo body; consultando la misma factura un momento
 después por `GET /v1/invoices/:id`, `stamp.cufe` ya estaba poblado
 (`stamp.status` pasó de lo que sea que traía al crear a `"Accepted"`).
-`siigoEmit` ahora reconsulta la factura por su `id` (que si viene en la
+`SiigoInvoiceProvider.issueInvoice` ahora reconsulta la factura por su `id` (que si viene en la
 respuesta del POST) hasta `SIIGO_STAMP_POLL_ATTEMPTS` veces (default 5,
 cada `SIIGO_STAMP_POLL_DELAY_MS` ms, default 2000 → ~10s en total) antes de
 darse por vencido. Si el CUFE sigue sin aparecer tras el poll, la venta
@@ -671,8 +773,9 @@ acción) — acá solo el resumen de arquitectura para no repetirlo:
 - **Cola separada** (`backend/src/queues/sheetsQueue.ts`, `sheets-sync`) +
   **worker separado** (`backend/src/workers/sheetsWorker.ts`, `npm run
   worker:sheets`, su propio servicio en `docker-compose.yml`) — mismo
-  principio que el worker DIAN (punto 5): nunca corre dentro de
-  `server.ts`. A diferencia del worker DIAN, este NO necesita conexión a
+  a diferencia del worker DIAN (punto 5), este sí sigue siendo
+  independiente: nunca corre dentro de `server.ts`. No necesita
+  conexión a
   Mongo — los jobs llevan el payload ya resuelto (nombres de sede/usuario,
   no ids), así que solo habla con Redis y con el webhook de Apps Script.
 - **`backend/src/utils/sheetsSync.ts`** expone `syncInventoryToSheets`,
@@ -985,13 +1088,17 @@ controladores. Si tocas esta lógica de nuevo, no reintroduzcas ese
 filtro sin discutirlo explícitamente — ya se probó y se revirtió.
 
 **Si el Disparador 2 queda `category: "SPECIAL"`, la venta intenta
-emitirse EN LÍNEA, no se encola** — `dianService.emit(sale)` se llama
-directo desde el controlador, `await`ado antes de responder (ver la
-excepción documentada en el punto 2). Es un solo intento, sin reintentos:
+emitirse EN LÍNEA primero** — el provider ya quedó fijado en
+`Sale.electronicInvoice` antes de crear la venta, y `dianService.emit(sale)`
+se llama directo desde el controlador, `await`ado antes de responder (ver la
+excepción documentada en el punto 2):
 - Si `result.status === "APPROVED"`: `sale.dianStatus`/`cufe`/
   `qrCodeUrl`/`dianInvoiceNumber` se actualizan con el resultado real antes
   de guardar — la respuesta HTTP ya trae el resultado final, no queda
   `PENDING`.
+- Si `result.status === "PENDING"` o `"SENT"`: se conserva `SPECIAL` y se
+  encola seguimiento. Factus usa `reference_code: SALE-<saleId>` para resolver
+  una factura ya creada en vez de emitir una segunda.
 - Si `result.status === "REJECTED"`, o la llamada lanza una excepción
   (network, Siigo caído, config faltante): `sale.category` se baja a
   `"REGULAR"` y `sale.dianStatus = "REJECTED"` — **decisión explícita, no
@@ -1002,6 +1109,11 @@ excepción documentada en el punto 2). Es un solo intento, sin reintentos:
   (dejando de contar en el `$match` de arriba, gracias al filtro por
   `category`), libera el cupo/cooldown para que una venta futura sí pueda
   calificar.
+- Excepción de coexistencia Factus: si la petición deja incierto el resultado
+  o Factus confirma creación pero aún responde `PENDING`/`SENT`, el provider
+  devuelve ese estado en vez de `REJECTED`. Se conserva `SPECIAL` y el
+  controlador encola el seguimiento con el mismo provider/referenceCode; el
+  worker/reconciliación no hacen POST con otro proveedor.
 
 **Costo real de este diseño — la respuesta de `createSale`/
 `createSaleAdmin` puede tardar más de lo normal**: el peor caso de Siigo
@@ -1011,19 +1123,16 @@ superar los 8s. Los clientes axios (`posHttp`/`adminHttp`,
 `posApi.createSale`/`adminApi.createSale` mandan un `timeout: 20000`
 explícito solo en esta llamada, en vez de subir el default global (que
 sigue protegiendo al resto de las peticiones de quedarse colgadas de
-verdad). En el cajero, `PaymentPanel.tsx` distingue los dos disparadores
-mirando `dianStatus` en la respuesta, no `category` a secas: `category
-=== "SPECIAL" && dianStatus === "PENDING"` (Disparador 1, todavía
-encolado) muestra `EmittingReceipt.tsx` y hace polling de `GET
-/api/pos/sales/:id/status`; cualquier otro caso (`REGULAR`, o `SPECIAL`
-ya resuelto por el Disparador 2) va directo al recibo real, porque no hay
-nada más que esperar.
+verdad). En el cajero, `PaymentPanel.tsx` espera cuando la venta es
+`category === "SPECIAL"` y `dianStatus` es `PENDING` o `SENT`; hace polling
+de `GET /api/pos/sales/:id/status` hasta un estado terminal. Cualquier otro
+caso (`REGULAR`, `APPROVED` o `REJECTED`) va directo al recibo real.
 
 **El panel admin (`SaleModal.tsx`) NO tiene el mismo polling** — a
 propósito, decisión explícita: un admin registrando una venta no es una
 fila de caja en vivo como el cajero, así que el recibo sigue mostrando el
 texto estático "Factura electrónica en proceso de validación DIAN" para
-una venta que quedó `PENDING` (Disparador 1) hasta que se refresque/
+una venta que quedó `PENDING` o `SENT` hasta que se refresque/
 reabra — no hay un `EmittingReceipt` equivalente ahí. Si esto cambia
 algún día, hay que construir esa UI desde cero, no asumir que ya existe.
 
@@ -1041,9 +1150,11 @@ notar que fundía dos situaciones distintas en una sola:
   crear la venta: `dianStatus: category === "REGULAR" ? "NOT_EMITTED" :
   "PENDING"` en vez de `"PENDING"` fijo.
 - **`REJECTED`**: la venta SÍ se intentó emitir y falló — cubre tanto al
-  Disparador 1 (`category: "SPECIAL"`, agotó los 5 reintentos del worker)
-  como al intento en línea del Disparador 2 que falla (`category` baja a
-  `"REGULAR"`, pero `dianStatus` queda `"REJECTED"`, no `"NOT_EMITTED"`).
+  Disparador 1 (mientras BullMQ aún tenga intentos, la categoría sigue
+  `SPECIAL`; en el rechazo terminal tras agotar los 5 intentos baja a
+  `REGULAR`) como al intento en línea del Disparador 2 (baja a `REGULAR` en
+  el mismo request), pero
+  `dianStatus` queda `"REJECTED"`, no `"NOT_EMITTED"`.
   **Motivo explícito de no fundirlos**: un intento fallido pudo haber
   llegado a tocar la API real de Siigo antes de fallar (ej. la conexión se
   cae justo después del `POST /v1/invoices` pero antes de leer la
@@ -1725,58 +1836,6 @@ inventario" una vez por producto — esto lo hace en una sola pantalla.
   tabla con una columna por sede activa no es usable en pantalla
   angosta).
 
-### 67. `dianWorker.ts` lleva un servidor HTTP mínimo (`GET /health`) para poder desplegarse como Web Service gratis de Render — no es parte de su lógica de negocio
-
-Decisión explícita del negocio, no una sugerencia del código: Render no
-ofrece plan gratis para Background Workers (arrancan en el plan Starter,
-de pago) pero sí para Web Services — con la condición de que el proceso
-abra un puerto HTTP y responda, o el deploy falla con "no open ports
-detected". `dianWorker.ts` agregó un `express()` mínimo, sin ninguna otra
-ruta más que `GET /health` (200, `{status, service, uptime}`), escuchando
-en `process.env.DIAN_WORKER_PORT || process.env.PORT || 3000` — arrancado
-como lo primero que hace `main()`, antes de `connectDB()`, para que el
-puerto quede abierto lo antes posible y no dependa de la latencia de Mongo
-al conectar.
-
-**Gotcha real ya corregido — en local, arrancaba con `EADDRINUSE :4000`
-si el API ya estaba corriendo.** La primera versión leía `process.env.PORT`
-directo, sin más — pero `dianWorker.ts` carga el mismo `backend/.env` que
-`server.ts` (`import "dotenv/config"` en ambos), y ese `.env` ya trae
-`PORT=4000` para el API. Con `npm run dev` corriendo en una terminal y
-`npm run worker:dian` en otra (el flujo normal de desarrollo — son
-procesos separados a propósito, ver punto 5), el segundo intentaba abrir
-ESE MISMO puerto 4000 y reventaba al arrancar. Se agregó `DIAN_WORKER_PORT`
-(`backend/.env`, `DIAN_WORKER_PORT=4002` en desarrollo) como variable
-específica del worker, con prioridad sobre `PORT` — en Render no hace
-falta definirla: al no existir ahí, cae directo a `PORT`, que Render
-inyecta solo para el servicio del worker.
-
-**Esto NO contradice el punto 5** ("el worker DIAN es un proceso separado
-del API, siempre") — sigue siendo `dianWorker.ts` corriendo solo, nunca se
-mezcló con `server.ts`/`app.ts`. El servidor HTTP es puramente una fachada
-de compatibilidad con el requisito de deploy de Render, no un cambio de
-arquitectura: el worker no expone ningún endpoint de negocio, y el API
-sigue sin saber que el worker tiene un puerto abierto.
-
-**A propósito no lleva `cors`** — mismo criterio que `GET /health` del API
-(punto 58): a este endpoint solo le pega un monitor externo (UptimeRobot o
-similar), no un navegador, así que CORS no aplica.
-
-**Riesgo aceptado explícitamente por el negocio, no un descuido — hay que
-mantener el proceso despierto con un ping externo:** un Web Service
-gratis de Render se suspende tras 15 minutos sin tráfico HTTP entrante.
-Sin un monitor externo pegándole a `/health` con un intervalo menor a eso
-(mismo patrón ya usado para el API, punto 58), el worker se duerme y dos
-cosas dejan de correr mientras tanto: el consumo de la cola BullMQ
-(`dian-emission-*`, ver punto 2) y el `setInterval` de reconciliación
-(punto 3) — ventas cobradas en ese lapso quedan `dianStatus: "PENDING"`
-sin nadie que las procese hasta el siguiente ping que lo despierte. Esto
-se evaluó explícitamente contra usar un Background Worker de pago o
-self-hostear con `docker-compose.yml`, y se decidió aceptar el riesgo por
-el ahorro de costo — si el volumen real de ventas hace que este hueco
-importe de verdad, la solución no es este archivo, es dejar de usar el
-plan gratis de Render para este proceso.
-
 ### 68. Seguridad de la API — rate limiting, `trust proxy`, anti-inyección NoSQL, anti-CSRF y validación de arranque
 
 Ver el punto 68 del `CLAUDE.md` raíz para el resumen y la tabla de variables de
@@ -1821,8 +1880,8 @@ son globales: van en la ruta (después de `express.json`, porque su llave usa el
   `status: 400`.
 - **Manejador de errores** — en producción los 5xx responden un mensaje genérico (el detalle solo
   va al log); `CastError` de Mongoose (ID mal formado) → 400; `MulterError` → 400.
-- **`workers/dianWorker.ts`** — su servidor `/health` usa `helmet()`. Sigue escuchando en `0.0.0.0`
-  a propósito (Render necesita alcanzarlo, ver punto 67).
+- **El worker DIAN** corre dentro del proceso del API (`server.ts`) — no expone `/health`
+  propio. `app.use(helmet())` en `app.ts` ya protege el endpoint compartido.
 - **Cookies** (`utils/cookies.ts`) no cambiaron: `httpOnly: true` siempre, `secure` según
   `COOKIE_SECURE`/`NODE_ENV`, `sameSite` "none" si es `secure` (frontend y backend en dominios
   distintos) o "lax". Con "none" se depende del chequeo de `Origin` de arriba como defensa anti-CSRF.

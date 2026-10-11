@@ -33,6 +33,7 @@ import {
 } from "../utils/dateRange";
 import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
 import { buildSaleItemFiscalSnapshot } from "../utils/fiscalSnapshot";
+import { sanitizeSaleItems } from "../utils/sanitizeSaleItems";
 import { sendWelcomeEmail } from "../utils/mailerResend";
 import { generateResetToken } from "../utils/passwordResetToken";
 import { applyInvoiceResult } from "../utils/applyInvoiceResult";
@@ -1271,27 +1272,47 @@ export async function createSaleAdmin(req: Request, res: Response) {
     });
   }
 
-  const saleItems = (items as any[]).map((it) => {
-    const product = productById.get(String(it.productId))!;
-    const quantity = Number(it.quantity);
+  // Mismo saneo que createSale/syncOfflineSales (ver posController.ts):
+  // el `price` y `subtotal` de cada ítem vienen del payload, NO del
+  // `Product.price` actual. Esto permite al admin hacer descuentos
+  // manuales (override de precio) y, sobre todo, garantiza que si mañana
+  // se cambia el precio de un producto, las ventas viejas conservan el
+  // precio histórico. Si el admin no mandó `price` en el ítem, fallback
+  // a `Product.price` actual (compat con payloads viejos que no lo mandaban).
+  // El `fiscalSnapshot` se agrega aparte (datos DIAN, no toca el precio).
+  const sanitized = sanitizeSaleItems(items);
+  const saleItems = sanitized.map((item) => {
+    const product = productById.get(String(item.productId));
+    // Fallback: si el admin no mandó `price` (caso raro, payload viejo),
+    // usamos el precio actual de la BD. Ya con sanitizeSaleItems esto
+    // nunca debería pasar (el helper acepta `price: 0` o `price: undefined`
+    // y lo sanea), pero dejamos la red de seguridad.
+    const price =
+      item.price > 0
+        ? item.price
+        : product
+        ? Number(product.price) || 0
+        : 0;
+    const quantity = item.quantity;
     return {
-      productId: product._id,
-      name: product.name,
+      productId: product ? product._id : item.productId,
+      name: product?.name || item.name,
       quantity,
-      price: product.price,
-      total: product.price * quantity,
-      fiscalSnapshot: buildSaleItemFiscalSnapshot(product),
+      price,
+      subtotal: price * quantity,
+      modifiers: item.modifiers,
+      fiscalSnapshot: product ? buildSaleItemFiscalSnapshot(product) : undefined,
     };
   });
 
-  const subtotal = saleItems.reduce((acc, it) => acc + it.total, 0);
+  const subtotal = saleItems.reduce((acc, it) => acc + it.subtotal, 0);
   // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
   // decisión explícita, `tax` se deja fijo en 0 en vez del 8% placeholder
   // que existía antes (mismo criterio que createSale/syncOfflineSales en
   // posController.ts). El campo se mantiene en `Sale` solo por
   // compatibilidad de lectura con ventas históricas.
   const tax = 0;
-  const total = saleItems.reduce((acc, it) => acc + it.total, 0);
+  const total = subtotal;
 
   /**
    * 

@@ -133,10 +133,16 @@ const SaleItemSchema = new Schema<ISaleItem>(
   {
     productId: { type: Schema.Types.ObjectId, ref: "Product", required: true },
     name: String,
-    quantity: Number,
-    price: Number,
-    modifiers: [{ name: String, extraPrice: Number }],
-    subtotal: Number,
+    // `quantity`, `price` y `subtotal` se marcan required: true con min: 0
+    // para que el schema rechace ventas nuevas con campos faltantes o
+    // negativos. El backend (sanitizeSaleItems en los 3 controllers)
+    // garantiza que SIEMPRE lleguen números válidos — required es la red
+    // de seguridad final. `modifiers` default [] para que el campo
+    // siempre exista, aunque sea vacío, y sea más fácil de leer/iterar.
+    quantity: { type: Number, required: true, min: 0 },
+    price: { type: Number, required: true, min: 0 },
+    modifiers: { type: [{ name: String, extraPrice: Number }], default: [] },
+    subtotal: { type: Number, required: true, min: 0 },
     fiscalSnapshot: {
       type: new Schema<ISaleItemFiscalSnapshot>(
         {

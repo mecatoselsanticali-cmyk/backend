@@ -13,6 +13,7 @@ import { getStartOfTodayColombia } from "../utils/dateRange";
 import { getThirtyMinutesMs, getMaxGroup1 } from "../utils/dianThresholds";
 import { buildSaleItemFiscalSnapshot } from "../utils/fiscalSnapshot";
 import { applyInvoiceResult } from "../utils/applyInvoiceResult";
+import { sanitizeSaleItems } from "../utils/sanitizeSaleItems";
 import { resolveConfiguredInvoiceProvider } from "../services/dian/providers/providerResolver";
 import { Types } from "mongoose";
 
@@ -161,9 +162,16 @@ export async function createSale(req: Request, res: Response) {
     });
   }
 
-  // El snapshot se construye en servidor desde Product; nunca se acepta uno
-  // enviado por el navegador. Los tickets offline antiguos siguen sin él.
-  const saleItems = (items as any[]).map((item) => {
+  // Saneo defensivo de los ítems antes de armar la venta:
+  //   - quantity/price/modifiers se fuerzan a tipos válidos.
+  //   - subtotal se RECALCULA como (price + sum(modifiers.extraPrice)) * quantity.
+  //   - El price congelado en la venta es el del payload (lo que el cashier
+  //     vio al cobrar) — NO se consulta `Product.price` actual, para que
+  //     un cambio de precio posterior no afecte ventas viejas.
+  // Después, el `fiscalSnapshot` se agrega aparte (consulta la BD solo para
+  // datos fiscales DIAN, no toca el precio).
+  const sanitized = sanitizeSaleItems(items);
+  const saleItems = sanitized.map((item) => {
     const product = fiscalProductById.get(String(item.productId));
     return {
       ...item,
@@ -171,7 +179,7 @@ export async function createSale(req: Request, res: Response) {
     };
   });
 
-  const subtotal = items.reduce((acc: number, it: any) => acc + it.subtotal, 0);
+  const subtotal = saleItems.reduce((acc, it) => acc + it.subtotal, 0);
   // El negocio no es responsable de declarar/cobrar impuestos (IVA/INC) —
   // decisión explícita, `tax` se deja fijo en 0 en vez de calcular el 8%
   // placeholder que existía antes. El campo se mantiene en `Sale` (no se
@@ -429,7 +437,15 @@ export async function syncOfflineSales(req: Request, res: Response) {
         }
       }
 
-      const subtotal = raw.items.reduce((acc: number, it: any) => acc + it.subtotal, 0);
+      // Mismo saneo que createSale (ver arriba): quantity/price/modifiers
+      // se fuerzan a tipos válidos y subtotal se recalcula. Aquí no
+      // consultamos Product para fiscalSnapshot — el endpoint offline
+      // acepta los ítems como vienen del IndexedDB del cajero, donde ya
+      // se guardaron con los precios del momento. Si la BD no tiene el
+      // producto (caso raro, no debería pasar), se crea la venta con los
+      // precios del payload, congelados.
+      const sanitizedItems = sanitizeSaleItems(raw.items);
+      const subtotal = sanitizedItems.reduce((acc, it) => acc + it.subtotal, 0);
       // Sin impuestos (ver el mismo criterio en createSale, arriba en este
       // archivo) — esto también corrige una inconsistencia real que ya
       // existía acá: este drenaje legado sumaba `tax` a `total`
@@ -446,7 +462,7 @@ export async function syncOfflineSales(req: Request, res: Response) {
         branchId: posSession.branchId,
         cashierId: posSession.cashierId,
         orderType: syncOrderType,
-        items: raw.items,
+        items: sanitizedItems,
         paymentMethod: resolvePaymentMethodForChannel(syncOrderType, raw.paymentMethod),
         paymentStatus: resolvePaymentStatus(syncOrderType),
         subtotal,

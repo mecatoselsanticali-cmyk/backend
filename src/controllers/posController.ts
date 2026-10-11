@@ -125,7 +125,7 @@ export async function createSale(req: Request, res: Response) {
   if (localTicketId) {
     const existing = await Sale.findOne({ localTicketId });
     if (existing) {
-      await existing.populate("branchId", "name address phone");
+      await existing.populate("branchId", "name address phone nit");
       await existing.populate("cashierId", "name");
       return res.status(200).json(existing);
     }
@@ -373,7 +373,7 @@ export async function createSale(req: Request, res: Response) {
   // (cajero/components/SaleReceipt.tsx) pueda renderizarse directo con esta
   // respuesta, sin una segunda llamada — mismo principio que
   // createSaleAdmin/listCashierSales.
-  await sale.populate("branchId", "name address phone");
+  await sale.populate("branchId", "name address phone nit");
   await sale.populate("cashierId", "name");
 
   return res.status(201).json(sale);
@@ -547,7 +547,7 @@ export async function listCashierSales(req: Request, res: Response) {
     .select(
       "total paymentMethod dianStatus cufe qrCodeUrl dianInvoiceNumber electronicInvoice.provider createdAt invoiceType orderType items subtotal tax customer status category branchId cashierId"
     )
-    .populate("branchId", "name address phone")
+    .populate("branchId", "name address phone nit")
     .populate("cashierId", "name");
 
   return res.json(sales);

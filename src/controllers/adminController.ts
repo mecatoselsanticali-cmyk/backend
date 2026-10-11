@@ -71,6 +71,7 @@ export async function listBranches(req: Request, res: Response) {
         { name: { $regex: escaped, $options: "i" } },
         { address: { $regex: escaped, $options: "i" } },
         { phone: { $regex: escaped, $options: "i" } },
+        { nit: { $regex: escaped, $options: "i" } },
       ];
     }
   }
@@ -113,6 +114,13 @@ const DEFAULT_SIIGO_DOCUMENT_ID = 32502;
 
 export async function createBranch(req: Request, res: Response) {
   const payload: any = { ...req.body };
+
+  // Normaliza `nit` a string canónico: null/undefined → "" (sede sin NIT, no
+  // rompe la impresión). `String(...).trim()` recorta espacios; `.slice(0,
+  // 30)` respeta el maxlength del schema sin lanzar ValidationError antes
+  // de llegar al `create`. Mismo patrón que `email: email || undefined`
+  // para campos opcionales (ver punto 18 de backend/CLAUDE.md).
+  payload.nit = String(payload.nit || "").trim().slice(0, 30);
 
   // `dianResponsible` no viene explícito en el body -> el default del
   // schema (`true`, ver Branch.ts) es el que manda, igual que acá.
@@ -1152,7 +1160,7 @@ export async function listSales(req: Request, res: Response) {
       .sort({ createdAt: -1 })
       .skip((page - 1) * pageSize)
       .limit(pageSize)
-      .populate("branchId", "name address phone")
+      .populate("branchId", "name address phone nit")
       .populate("cashierId", "name"),
     Sale.countDocuments(filter),
     // La UI muestra un total en dinero de TODAS las ventas del filtro (no
@@ -1501,7 +1509,7 @@ export async function createSaleAdmin(req: Request, res: Response) {
   // Poblado antes de responder para que el recibo (SaleReceipt.tsx) pueda
   // mostrar nombre/dirección/teléfono de la sede y nombre del vendedor sin
   // una segunda llamada — mismo shape que devuelve listSales.
-  await sale.populate("branchId", "name address phone");
+  await sale.populate("branchId", "name address phone nit");
   await sale.populate("cashierId", "name");
 
   return res.status(201).json(sale);
@@ -1586,7 +1594,7 @@ export async function confirmSalePayment(req: Request, res: Response) {
     console.error(`[confirmSalePayment] No se pudo sincronizar la confirmación de ${sale._id} a Sheets:`, err);
   });
 
-  await sale.populate("branchId", "name address phone");
+  await sale.populate("branchId", "name address phone nit");
   await sale.populate("cashierId", "name");
 
   return res.json(sale);

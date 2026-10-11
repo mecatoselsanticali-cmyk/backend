@@ -22,6 +22,14 @@ export interface IBranch extends Document {
   name: string;
   address: string;
   phone: string;
+  // NIT de la razón social de esta sede. Varía por sede (cada sede puede
+  // ser una razón social distinta o tener un NIT propio para facturación).
+  // Se imprime en el recibo en pantalla y en el ticket térmico (antes era
+  // una constante hardcodeada en 3 archivos, ahora es un dato de la sede).
+  // `default: ""` para que los documentos existentes sin este campo (mongo
+  // los rellena al hacer find) impriman la línea vacía en vez de un NIT
+  // falso — el admin edita la sede y lo llena.
+  nit: string;
   dianConfig: IDianConfig;
   dianResponsible: boolean; // Responsable de declarar ante la DIAN (dato informativo, no gatea la emisión — ver punto 10 de CLAUDE.md)
   status: boolean;
@@ -46,6 +54,7 @@ const BranchSchema = new Schema<IBranch>(
     name: { type: String, required: true, trim: true },
     address: { type: String, required: true },
     phone: { type: String, required: true },
+    nit: { type: String, default: "", trim: true, maxlength: 30 },
     dianConfig: { type: DianConfigSchema, default: () => ({}) },
     dianResponsible: { type: Boolean, default: true },
     status: { type: Boolean, default: true },

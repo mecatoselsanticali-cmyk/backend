@@ -47,6 +47,10 @@ class DianService {
       throw error;
     }
 
+    // Solo diagnóstico técnico: no registrar payload, comprador ni tokens.
+    if (result.status === "REJECTED") {
+      console.error(`[DIAN] venta=${sale._id} provider=${providerName} stage=${result.providerStatus || "UNSPECIFIED"}`);
+    }
     sale.electronicInvoice.externalId = result.externalId ?? sale.electronicInvoice.externalId;
     sale.electronicInvoice.referenceCode = result.referenceCode ?? sale.electronicInvoice.referenceCode;
     sale.electronicInvoice.providerStatus = result.providerStatus ?? sale.electronicInvoice.providerStatus;

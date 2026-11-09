@@ -1926,3 +1926,13 @@ reinicio/timeout después de entregar el correo puede ocasionar un correo repeti
 (la API de envío no aporta idempotencia). No se rellenan correos de facturas
 históricas aprobadas automáticamente. Los reintentos de emisión consultan primero
 por reference_code; si existe, recuperan el resultado sin otro POST de emisión.
+
+Corrección de recuperación Factus: la búsqueda por referencia ahora consulta
+GET `/v2/bills/:number` para recuperar el detalle (CUFE, QR e is_validated),
+en vez de normalizar solo el resumen paginado. Si un resultado incierto
+(REQUEST_OUTCOME_UNKNOWN, UNKNOWN_RESPONSE, REFERENCE_LOOKUP_PENDING,
+PENDING_VALIDATION, HTTP_*), o una factura con externalId, deja de ser visible,
+se conserva PENDING/REFERENCE_NOT_VISIBLE sin otro POST. Puede requerir
+intervención si la factura nunca llegó a crearse: se prioriza no reemitir un
+resultado incierto. Esto no repara automáticamente ventas ya REJECTED/REGULAR.
+Las pruebas cubren listado incompleto + detalle y lookup vacío tras timeout.

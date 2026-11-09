@@ -231,7 +231,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     try {
       getFactusBaseUrl();
     } catch (error) {
-      return { status: "REJECTED", error: (error as Error).message };
+      return { status: "REJECTED", providerStatus: "LOCAL_ENV_INVALID", error: (error as Error).message };
     }
 
     const missingCredentials = [
@@ -243,6 +243,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     if (missingCredentials.length) {
       return {
         status: "REJECTED",
+        providerStatus: "LOCAL_CREDENTIALS_MISSING",
         error: `Faltan credenciales Factus en el backend: ${missingCredentials.join(", ")}`,
       };
     }
@@ -250,7 +251,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     const numberingRangeRaw = process.env.FACTUS_NUMBERING_RANGE_ID?.trim();
     const numberingRangeId = numberingRangeRaw ? Number(numberingRangeRaw) : undefined;
     if (numberingRangeRaw && (!Number.isInteger(numberingRangeId) || Number(numberingRangeId) <= 0)) {
-      return { status: "REJECTED", error: "FACTUS_NUMBERING_RANGE_ID debe ser un entero positivo" };
+      return { status: "REJECTED", providerStatus: "LOCAL_RANGE_INVALID", error: "FACTUS_NUMBERING_RANGE_ID debe ser un entero positivo" };
     }
 
     const productsNeedingFallback = sale.items.filter((item) => !item.fiscalSnapshot);
@@ -265,13 +266,22 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
       // El correo se procesa después de la aprobación, fuera del cobro.
       sendEmail: false,
     });
-    if ("error" in built) return { status: "REJECTED", error: built.error };
+    if ("error" in built) return { status: "REJECTED", providerStatus: "LOCAL_PAYLOAD_INVALID", error: built.error };
 
     // En reintentos recuperamos el documento antes de volver a emitirlo.
     if ((sale.electronicInvoice?.attempts || 0) > 1 || sale.electronicInvoice?.externalId) {
       try {
         const existing = await this.findByReferenceCode(built.payload.reference_code);
         if (existing) return normalizeFactusResult({ data: existing }, built.payload.reference_code);
+        if (sale.electronicInvoice?.externalId || [
+          "REQUEST_OUTCOME_UNKNOWN", "REFERENCE_LOOKUP_PENDING", "REFERENCE_NOT_VISIBLE",
+          "UNKNOWN_RESPONSE", "PENDING_VALIDATION",
+        ].includes(sale.electronicInvoice?.providerStatus || "") ||
+            sale.electronicInvoice?.providerStatus?.startsWith("HTTP_")) {
+          return { status: "PENDING", referenceCode: built.payload.reference_code,
+            providerStatus: "REFERENCE_NOT_VISIBLE",
+            error: "Resultado de emisión incierto; se mantiene en consulta sin volver a emitir" };
+        }
       } catch (error) {
         return { status: "PENDING", referenceCode: built.payload.reference_code,
           providerStatus: "REFERENCE_LOOKUP_PENDING",
@@ -284,7 +294,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
       await getFactusAccessToken();
     } catch (error) {
       if (error instanceof FactusApiError && [400, 401, 403].includes(error.status || 0)) {
-        return { status: "REJECTED", referenceCode: built.payload.reference_code, error: error.message };
+        return { status: "REJECTED", providerStatus: `AUTH_HTTP_${error.status}`, referenceCode: built.payload.reference_code, error: error.message };
       }
       throw error;
     }
@@ -301,7 +311,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
       // reconciliar por el mismo reference_code, sin degradar SPECIAL ni
       // intentar crearla con otro provider.
       if (error instanceof FactusApiError && [400, 401, 403].includes(error.status || 0)) {
-        return { status: "REJECTED", referenceCode: built.payload.reference_code, error: error.message };
+        return { status: "REJECTED", providerStatus: `AUTH_HTTP_${error.status}`, referenceCode: built.payload.reference_code, error: error.message };
       }
       return {
         status: "PENDING",
@@ -341,7 +351,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
       };
     }
 
-    return { status: "REJECTED", referenceCode: built.payload.reference_code, error: message };
+    return { status: "REJECTED", providerStatus: `EMISSION_HTTP_${response.status}`, referenceCode: built.payload.reference_code, error: message };
   }
 
   async sendEmail(number: string, email: string): Promise<void> {
@@ -363,6 +373,22 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     }
 
     const body = await responseBody(response);
-    return findInvoiceRecords(body).find((invoice) => invoice?.reference_code === referenceCode);
+    const listed = findInvoiceRecords(body).find((invoice) => invoice?.reference_code === referenceCode);
+    if (!listed) return undefined;
+    // Listar entrega un resumen: el CUFE/QR y la validación se leen del detalle.
+    if (typeof listed.number !== "string" || !listed.number) return listed;
+    const detailResponse = await authorizedRequest(`/v2/bills/${encodeURIComponent(listed.number)}`, { method: "GET" });
+    if (!detailResponse.ok) {
+      throw new FactusApiError(errorMessage(await responseBody(detailResponse), `Factus detalle respondió ${detailResponse.status}`), detailResponse.status);
+    }
+    const detail = await responseBody(detailResponse);
+    const bill = detail?.data?.bill || detail?.data;
+    if (!bill || typeof bill !== "object" || Array.isArray(bill)) {
+      throw new Error("Factus no devolvió el detalle de la factura existente");
+    }
+    if (bill.reference_code && bill.reference_code !== referenceCode) {
+      throw new Error("La referencia del detalle no coincide con la venta; no se reemite");
+    }
+    return { ...listed, ...bill };
   }
 }

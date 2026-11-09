@@ -278,6 +278,7 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
 
     let response: Response;
     try {
+      console.log("[Backend → Factus] POST", `${getFactusBaseUrl()}${path}`, "payload:", JSON.stringify(built.payload, null, 2));
       response = await authorizedRequest(path, {
         method: "POST",
         body: JSON.stringify(built.payload),

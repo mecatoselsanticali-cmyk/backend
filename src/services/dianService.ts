@@ -22,6 +22,7 @@ registerInvoiceProvider("FACTUS", new FactusInvoiceProvider());
 
 class DianService {
   async emit(sale: ISale): Promise<InvoiceResult> {
+    console.log(`[DIAN] Inicio de emisión venta=${sale._id}`);
     // Para ventas creadas antes del subdocumento, la primera reanudación usa
     // la configuración vigente y la persiste antes de tocar el PTA. Desde
     // ese momento, todos los reintentos quedan amarrados al mismo proveedor.
@@ -33,6 +34,7 @@ class DianService {
     }
 
     const providerName = sale.electronicInvoice.provider;
+    console.log(`[DIAN] venta=${sale._id} proveedor=${providerName}`);
     sale.electronicInvoice.attempts = (sale.electronicInvoice.attempts || 0) + 1;
     sale.electronicInvoice.lastAttemptAt = new Date();
     sale.electronicInvoice.lastError = undefined;
@@ -42,11 +44,13 @@ class DianService {
     try {
       result = await getInvoiceProvider(providerName).issueInvoice(sale);
     } catch (error) {
+      console.error(`[DIAN] Excepción en proveedor venta=${sale._id} proveedor=${providerName}`, error instanceof Error ? error.message : String(error));
       sale.electronicInvoice.lastError = error instanceof Error ? error.message : String(error);
       await sale.save();
       throw error;
     }
 
+    console.log(`[DIAN] Resultado venta=${sale._id} proveedor=${providerName} estado=${result.status}`, result.error || "");
     sale.electronicInvoice.externalId = result.externalId ?? sale.electronicInvoice.externalId;
     sale.electronicInvoice.referenceCode = result.referenceCode ?? sale.electronicInvoice.referenceCode;
     sale.electronicInvoice.providerStatus = result.providerStatus ?? sale.electronicInvoice.providerStatus;

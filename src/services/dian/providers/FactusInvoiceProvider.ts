@@ -228,6 +228,7 @@ function findInvoiceRecords(body: any): any[] {
 
 export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
   async issueInvoice(sale: ISale): Promise<InvoiceResult> {
+    console.log(`[Factus] Inicio de validación local venta=${sale._id}`);
     try {
       getFactusBaseUrl();
     } catch (error) {
@@ -267,8 +268,10 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     if ("error" in built) return { status: "REJECTED", error: built.error };
 
     const path = "/v2/bills/validate";
+    console.log(`[Factus] Payload construido venta=${sale._id}; obteniendo token OAuth`);
     try {
       await getFactusAccessToken();
+      console.log(`[Factus] Token disponible venta=${sale._id}`);
     } catch (error) {
       if (error instanceof FactusApiError && [400, 401, 403].includes(error.status || 0)) {
         return { status: "REJECTED", referenceCode: built.payload.reference_code, error: error.message };

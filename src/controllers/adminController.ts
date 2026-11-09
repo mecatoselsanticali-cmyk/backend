@@ -1147,6 +1147,7 @@ export async function listSales(req: Request, res: Response) {
       const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filter.$or = [
         { cufe: { $regex: escaped, $options: "i" } },
+        { dianInvoiceNumber: { $regex: escaped, $options: "i" } },
         { $expr: { $regexMatch: { input: { $toString: "$_id" }, regex: escaped, options: "i" } } },
       ];
     }

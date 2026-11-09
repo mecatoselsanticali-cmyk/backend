@@ -1,3 +1,4 @@
+import { sendPendingInvoiceEmails } from "../jobs/sendPendingInvoiceEmails";
 import { Worker, Job } from "bullmq";
 import mongoose from "mongoose";
 import { connection } from "../config/redis";
@@ -107,6 +108,16 @@ export function startDianWorker(): DianWorkerHandle {
       console.error("[Reconciliation] Error:", err)
     );
 
+  let emailRunning = false;
+  const runEmails = async () => {
+    if (emailRunning) return;
+    emailRunning = true;
+    try { await sendPendingInvoiceEmails(); }
+    catch { console.error("[InvoiceEmail] No se pudo procesar la bandeja de correo"); }
+    finally { emailRunning = false; }
+  };
+  const emailTimer = setInterval(runEmails, 5000);
+  runEmails();
   runReconcileOnce();
   reconcileTimer = setInterval(runReconcileOnce, intervalMinutes * 60 * 1000);
 
@@ -119,6 +130,7 @@ export function startDianWorker(): DianWorkerHandle {
   return {
     worker,
     async stop() {
+      clearInterval(emailTimer);
       if (reconcileTimer) clearInterval(reconcileTimer);
       await worker.close();
     },

@@ -69,6 +69,12 @@ export interface ISaleCustomer {
 }
 
 export interface IElectronicInvoice {
+  emailStatus?: "PENDING" | "SENDING" | "SENT" | "FAILED";
+  emailAttempts?: number;
+  emailNextAttemptAt?: Date;
+  emailLastError?: string;
+  emailEnvironment?: string;
+  emailInvoiceNumber?: string;
   provider: ElectronicInvoiceProviderType;
   externalId?: string;
   referenceCode?: string;
@@ -170,6 +176,12 @@ const ElectronicInvoiceSchema = new Schema<IElectronicInvoice>(
     attempts: { type: Number, required: true, default: 0 },
     lastAttemptAt: Date,
     lastError: String,
+    emailStatus: { type: String, enum: ["PENDING", "SENDING", "SENT", "FAILED"] },
+    emailAttempts: Number,
+    emailNextAttemptAt: Date,
+    emailLastError: String,
+    emailEnvironment: String,
+    emailInvoiceNumber: String,
     rawResponse: Schema.Types.Mixed,
   },
   { _id: false }

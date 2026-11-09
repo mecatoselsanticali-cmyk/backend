@@ -51,6 +51,15 @@ class DianService {
     sale.electronicInvoice.referenceCode = result.referenceCode ?? sale.electronicInvoice.referenceCode;
     sale.electronicInvoice.providerStatus = result.providerStatus ?? sale.electronicInvoice.providerStatus;
     sale.electronicInvoice.lastError = result.error;
+    if (providerName === "FACTUS" && result.status === "APPROVED" && result.cufe && result.invoiceNumber &&
+        process.env.FACTUS_SEND_EMAIL === "true" && sale.customer?.email?.trim() &&
+        !sale.electronicInvoice.emailStatus) {
+      sale.electronicInvoice.emailStatus = "PENDING";
+      sale.electronicInvoice.emailAttempts = 0;
+      sale.electronicInvoice.emailNextAttemptAt = new Date();
+      sale.electronicInvoice.emailEnvironment = process.env.FACTUS_ENV || "sandbox";
+      sale.electronicInvoice.emailInvoiceNumber = result.invoiceNumber;
+    }
     // `rawResponse` no se persiste: no es necesario para el flujo y evita
     // almacenar PII o secretos que un proveedor pudiera incluir por error.
     await sale.save();

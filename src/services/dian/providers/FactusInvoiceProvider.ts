@@ -262,9 +262,22 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
       : [];
     const built = buildFactusInvoicePayload(sale, products, {
       numberingRangeId,
-      sendEmail: process.env.FACTUS_SEND_EMAIL === "true" && Boolean(sale.customer?.email),
+      // El correo se procesa después de la aprobación, fuera del cobro.
+      sendEmail: false,
     });
     if ("error" in built) return { status: "REJECTED", error: built.error };
+
+    // En reintentos recuperamos el documento antes de volver a emitirlo.
+    if ((sale.electronicInvoice?.attempts || 0) > 1 || sale.electronicInvoice?.externalId) {
+      try {
+        const existing = await this.findByReferenceCode(built.payload.reference_code);
+        if (existing) return normalizeFactusResult({ data: existing }, built.payload.reference_code);
+      } catch (error) {
+        return { status: "PENDING", referenceCode: built.payload.reference_code,
+          providerStatus: "REFERENCE_LOOKUP_PENDING",
+          error: error instanceof Error ? error.message : String(error) };
+      }
+    }
 
     const path = "/v2/bills/validate";
     try {
@@ -329,6 +342,16 @@ export class FactusInvoiceProvider implements ElectronicInvoiceProvider {
     }
 
     return { status: "REJECTED", referenceCode: built.payload.reference_code, error: message };
+  }
+
+  async sendEmail(number: string, email: string): Promise<void> {
+    const response = await authorizedRequest(`/v2/bills/${encodeURIComponent(number)}/send-email`, {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    });
+    if (!response.ok) {
+      throw new FactusApiError(errorMessage(await responseBody(response), `Factus correo respondió ${response.status}`), response.status);
+    }
   }
 
   private async findByReferenceCode(referenceCode: string): Promise<any | undefined> {

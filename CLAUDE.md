@@ -1910,29 +1910,3 @@ peticiones y parecen IPs de infraestructura (no la del usuario), probablemente h
 prueba `TRUST_PROXY=2`. **Ojo**: un valor MAYOR al real permite que un atacante falsifique su IP con un
 `X-Forwarded-For` propio y se salte los limitadores por IP — no lo subas sin comprobar en los logs cuántos
 saltos hay de verdad.
-
-
-### Factus: correo independiente de emisión
-La emisión siempre envía `send_email: false`. `FACTUS_SEND_EMAIL=true` solicita
-correo diferido para nuevas aprobaciones con CUFE, número y correo del cliente.
-`dianService` persiste una outbox en `Sale.electronicInvoice.emailStatus`,
-`emailAttempts`, `emailNextAttemptAt`, `emailLastError`, `emailEnvironment` y
-`emailInvoiceNumber`. El worker principal revisa cada 5 segundos los correos de
-ventas APPROVED, reclama cada envío atómicamente con lease de 10 minutos y usa
-POST `/v2/bills/:number/send-email` con `{email}`. Hay hasta 5 intentos con
-backoff; los fallos solo afectan emailStatus, nunca dianStatus/CUFE ni categoría.
-La outbox sobrevive reinicios y no procesa registros de otro FACTUS_ENV. Un
-reinicio/timeout después de entregar el correo puede ocasionar un correo repetido
-(la API de envío no aporta idempotencia). No se rellenan correos de facturas
-históricas aprobadas automáticamente. Los reintentos de emisión consultan primero
-por reference_code; si existe, recuperan el resultado sin otro POST de emisión.
-
-Corrección de recuperación Factus: la búsqueda por referencia ahora consulta
-GET `/v2/bills/:number` para recuperar el detalle (CUFE, QR e is_validated),
-en vez de normalizar solo el resumen paginado. Si un resultado incierto
-(REQUEST_OUTCOME_UNKNOWN, UNKNOWN_RESPONSE, REFERENCE_LOOKUP_PENDING,
-PENDING_VALIDATION, HTTP_*), o una factura con externalId, deja de ser visible,
-se conserva PENDING/REFERENCE_NOT_VISIBLE sin otro POST. Puede requerir
-intervención si la factura nunca llegó a crearse: se prioriza no reemitir un
-resultado incierto. Esto no repara automáticamente ventas ya REJECTED/REGULAR.
-Las pruebas cubren listado incompleto + detalle y lookup vacío tras timeout.

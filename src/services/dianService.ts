@@ -47,23 +47,10 @@ class DianService {
       throw error;
     }
 
-    // Solo diagnóstico técnico: no registrar payload, comprador ni tokens.
-    if (result.status === "REJECTED") {
-      console.error(`[DIAN] venta=${sale._id} provider=${providerName} stage=${result.providerStatus || "UNSPECIFIED"}`);
-    }
     sale.electronicInvoice.externalId = result.externalId ?? sale.electronicInvoice.externalId;
     sale.electronicInvoice.referenceCode = result.referenceCode ?? sale.electronicInvoice.referenceCode;
     sale.electronicInvoice.providerStatus = result.providerStatus ?? sale.electronicInvoice.providerStatus;
     sale.electronicInvoice.lastError = result.error;
-    if (providerName === "FACTUS" && result.status === "APPROVED" && result.cufe && result.invoiceNumber &&
-        process.env.FACTUS_SEND_EMAIL === "true" && sale.customer?.email?.trim() &&
-        !sale.electronicInvoice.emailStatus) {
-      sale.electronicInvoice.emailStatus = "PENDING";
-      sale.electronicInvoice.emailAttempts = 0;
-      sale.electronicInvoice.emailNextAttemptAt = new Date();
-      sale.electronicInvoice.emailEnvironment = process.env.FACTUS_ENV || "sandbox";
-      sale.electronicInvoice.emailInvoiceNumber = result.invoiceNumber;
-    }
     // `rawResponse` no se persiste: no es necesario para el flujo y evita
     // almacenar PII o secretos que un proveedor pudiera incluir por error.
     await sale.save();

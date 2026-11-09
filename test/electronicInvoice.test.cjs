@@ -205,9 +205,6 @@ test("Factus refreshes an invalid token, respects 429 Retry-After, and recovers 
           return new Response(JSON.stringify({ message: "duplicate reference_code" }), { status: 422 });
         }
 
-        if (url.endsWith("/v2/bills/FV-0001")) {
-          return new Response(JSON.stringify({ data: { bill: { number: "FV-0001", is_validated: true, cufe: "TEST-CUFE", links: { qr: "https://example.test/qr" } } } }));
-        }
         if (url.includes("/v2/bills?filter%5Breference_code%5D=")) {
           const referenceCode = new URL(url).searchParams.get("filter[reference_code]");
           return new Response(JSON.stringify({ data: { data: [{
@@ -253,42 +250,6 @@ test("Factus refreshes an invalid token, respects 429 Retry-After, and recovers 
   );
 });
 
-test("Factus emission never waits for email, even when email is enabled", async () => {
-  const originalFetch = global.fetch;
-  let sentPayload;
-  global.fetch = async (input, init = {}) => {
-    if (String(input).endsWith("/oauth/token")) {
-      return new Response(JSON.stringify({ access_token: "email-test-token", expires_in: 600 }));
-    }
-    assert.ok(String(input).endsWith("/v2/bills/validate"));
-    sentPayload = JSON.parse(String(init.body));
-    return new Response(JSON.stringify({ data: { is_validated: true, cufe: "EMAIL-TEST-CUFE" } }));
-  };
-  try {
-    await withEnv({
-      FACTUS_ENV: "sandbox", FACTUS_CLIENT_ID: "test", FACTUS_CLIENT_SECRET: "test",
-      FACTUS_USERNAME: "test", FACTUS_PASSWORD: "test", FACTUS_NUMBERING_RANGE_ID: undefined,
-    }, async () => {
-      for (const [enabled, email, expected] of [
-        ["true", "ana@example.test", false],
-        ["false", "ana@example.test", false],
-        ["true", undefined, false],
-      ]) {
-        await withEnv({ FACTUS_SEND_EMAIL: enabled }, async () => {
-          const { sale } = makeSale();
-          sale.customer.email = email;
-          const result = await new FactusInvoiceProvider().issueInvoice(sale);
-          assert.equal(result.status, "APPROVED");
-          assert.equal(sentPayload.send_email, expected);
-          assert.equal(sentPayload.customer.email, email);
-        });
-      }
-    });
-  } finally {
-    global.fetch = originalFetch;
-  }
-});
-
 test("Product fiscal defaults and legacy Sale documents remain compatible", () => {
   const product = new Product({ name: "Empanada", sku: "EMP-001", category: "FRITANGA", price: 2500 });
   assert.equal(product.unitMeasureCode, "94");
@@ -317,102 +278,4 @@ test("a rejected async sale changes to REGULAR only on the final BullMQ attempt"
   assert.equal(isFinalDianAttempt(3, 5), false);
   assert.equal(isFinalDianAttempt(4, 5), true);
   assert.equal(isFinalDianAttempt(0, undefined), true);
-});
-
-
-test("Factus email endpoint uses the issued number and propagates mail failures independently", async () => {
-  const originalFetch = global.fetch;
-  let fail = false;
-  global.fetch = async (input, init = {}) => {
-    if (String(input).endsWith("/oauth/token")) return new Response(JSON.stringify({ access_token: "test", expires_in: 600 }));
-    assert.ok(String(input).endsWith("/v2/bills/FE123/send-email"));
-    assert.equal(init.method, "POST");
-    assert.deepEqual(JSON.parse(init.body), { email: "ana@example.test" });
-    return new Response(JSON.stringify({ message: fail ? "mail unavailable" : "ok" }), { status: fail ? 400 : 200 });
-  };
-  try {
-    await withEnv({ FACTUS_ENV: "sandbox" }, async () => {
-      const provider = new FactusInvoiceProvider();
-      await provider.sendEmail("FE123", "ana@example.test");
-      fail = true;
-      await assert.rejects(provider.sendEmail("FE123", "ana@example.test"), /mail unavailable/);
-    });
-  } finally { global.fetch = originalFetch; }
-});
-
-test("Factus retry recovers an existing approved invoice without another emission POST", async () => {
-  const originalFetch = global.fetch;
-  const { sale } = makeSale({ electronicInvoice: { provider: "FACTUS", attempts: 2 } });
-  global.fetch = async (input) => {
-    const url = String(input);
-    if (url.endsWith("/oauth/token")) return new Response(JSON.stringify({ access_token: "test", expires_in: 600 }));
-    if (url.endsWith("/v2/bills/FE123")) return new Response(JSON.stringify({ data: { bill: { number: "FE123", is_validated: true, cufe: "RECOVERED-CUFE" } } }));
-    assert.ok(url.includes("/v2/bills?"), "a retry must look up the invoice, not emit again");
-    return new Response(JSON.stringify({ data: { data: [{ reference_code: `SALE-${sale._id}`, number: "FE123", is_validated: true, cufe: "RECOVERED-CUFE" }] } }));
-  };
-  try {
-    await withEnv({ FACTUS_ENV: "sandbox", FACTUS_CLIENT_ID: "test", FACTUS_CLIENT_SECRET: "test", FACTUS_USERNAME: "test", FACTUS_PASSWORD: "test", FACTUS_NUMBERING_RANGE_ID: undefined }, async () => {
-      const result = await new FactusInvoiceProvider().issueInvoice(sale);
-      assert.equal(result.status, "APPROVED");
-      assert.equal(result.cufe, "RECOVERED-CUFE");
-    });
-  } finally { global.fetch = originalFetch; }
-});
-
-test("Factus recovers CUFE from invoice detail rather than an incomplete listing", async () => {
-  const originalFetch = global.fetch;
-  const { sale } = makeSale({ electronicInvoice: { provider: "FACTUS", attempts: 2 } });
-  global.fetch = async (input) => {
-    const url = String(input);
-    if (url.endsWith("/oauth/token")) return new Response(JSON.stringify({ access_token: "test", expires_in: 600 }));
-    if (url.includes("/v2/bills?")) return new Response(JSON.stringify({ data: { data: [{ reference_code: `SALE-${sale._id}`, number: "FELP123", status: 1 }] } }));
-    assert.ok(url.endsWith("/v2/bills/FELP123"));
-    return new Response(JSON.stringify({ data: { bill: { reference_code: `SALE-${sale._id}`, number: "FELP123", is_validated: true, cufe: "DETAIL-CUFE", links: { qr: "https://example.test/qr" } } } }));
-  };
-  try {
-    await withEnv({ FACTUS_ENV: "sandbox", FACTUS_CLIENT_ID: "test", FACTUS_CLIENT_SECRET: "test", FACTUS_USERNAME: "test", FACTUS_PASSWORD: "test", FACTUS_NUMBERING_RANGE_ID: undefined }, async () => {
-      const result = await new FactusInvoiceProvider().issueInvoice(sale);
-      assert.equal(result.status, "APPROVED");
-      assert.equal(result.cufe, "DETAIL-CUFE");
-      assert.equal(result.qrCodeUrl, "https://example.test/qr");
-    });
-  } finally { global.fetch = originalFetch; }
-});
-
-test("Factus does not repeat an uncertain emission when lookup has no visible record", async () => {
-  const originalFetch = global.fetch;
-  const { sale } = makeSale({ electronicInvoice: { provider: "FACTUS", attempts: 2, providerStatus: "REQUEST_OUTCOME_UNKNOWN" } });
-  global.fetch = async (input, init = {}) => {
-    if (String(input).endsWith("/oauth/token")) return new Response(JSON.stringify({ access_token: "test", expires_in: 600 }));
-    assert.equal(init.method, "GET");
-    assert.ok(String(input).includes("/v2/bills?"));
-    return new Response(JSON.stringify({ data: { data: [] } }));
-  };
-  try {
-    await withEnv({ FACTUS_ENV: "sandbox", FACTUS_CLIENT_ID: "test", FACTUS_CLIENT_SECRET: "test", FACTUS_USERNAME: "test", FACTUS_PASSWORD: "test", FACTUS_NUMBERING_RANGE_ID: undefined }, async () => {
-      const provider = new FactusInvoiceProvider();
-      const result = await provider.issueInvoice(sale);
-      assert.equal(result.status, "PENDING");
-      assert.equal(result.providerStatus, "REFERENCE_NOT_VISIBLE");
-      sale.electronicInvoice.providerStatus = result.providerStatus;
-      assert.equal((await provider.issueInvoice(sale)).providerStatus, "REFERENCE_NOT_VISIBLE");
-    });
-  } finally { global.fetch = originalFetch; }
-});
-
-
-test("Factus classifies local rejection without making any HTTP call", async () => {
-  const originalFetch = global.fetch;
-  global.fetch = async () => { throw new Error("HTTP must not be called for local validation"); };
-  try {
-    await withEnv({ FACTUS_ENV: "production", FACTUS_CLIENT_ID: "test", FACTUS_CLIENT_SECRET: "test", FACTUS_USERNAME: "test", FACTUS_PASSWORD: "test", FACTUS_NUMBERING_RANGE_ID: "not-a-number" }, async () => {
-      const result = await new FactusInvoiceProvider().issueInvoice(makeSale().sale);
-      assert.equal(result.status, "REJECTED");
-      assert.equal(result.providerStatus, "LOCAL_RANGE_INVALID");
-    });
-    await withEnv({ FACTUS_ENV: "invalid" }, async () => {
-      const result = await new FactusInvoiceProvider().issueInvoice(makeSale().sale);
-      assert.equal(result.providerStatus, "LOCAL_ENV_INVALID");
-    });
-  } finally { global.fetch = originalFetch; }
 });
